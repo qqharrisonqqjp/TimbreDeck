@@ -36,9 +36,12 @@ class TTS_Config:
 class TTS:
     def __init__(self, config): pass
     def run(self, args):
+        if args["text"] == "失敗。":
+            yield 16000, bytes(32000)
+            raise RuntimeError("upstream failure after fallback audio")
         assert args["text"] == "第一句。" and args["text_lang"] == "yue"
         assert args["prompt_text"] == "參考。" and args["speed_factor"] == 1.25
-        yield 24000, bytes(4800)
+        yield 24000, bytes([1, 0]) * 2400
 """
 COSY = """
 class Audio:
@@ -99,6 +102,7 @@ def fixtures(root):
         if engine == "cosyvoice3":
             file(pkg / "cosyvoice/cli/cosyvoice.py", COSY)
         else:
+            file(pkg / "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin", "test fixture")
             file(pkg / "torch.py", "class cuda:\n    is_available = staticmethod(lambda: False)\n")
             file(pkg / "GPT_SoVITS/TTS_infer_pack/TTS.py", GPT)
 
@@ -151,6 +155,12 @@ def main():
                 with wave.open(io.BytesIO(audio)) as result:
                     assert result.getframerate() == 24000
                     assert result.getnframes() == (2400 if engine == "gpt-sovits" else 4800)
+            failed = dict(request, engine="gpt-sovits", mode="clone", text="失敗。")
+            api("/api/synthesize", failed)
+            deadline = time.monotonic() + 20
+            while api("/api/job")["status"] == "running" and time.monotonic() < deadline:
+                time.sleep(.1)
+            assert api("/api/job")["status"] == "failed"
             assert len(api("/api/history")) == 4
         finally:
             runtime.terminate()
