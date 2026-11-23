@@ -1,0 +1,10 @@
+/build/
+/dist/
+/models/
+/runtimes/
+/outputs/
+/training/
+/voices/
+/cache/
+/logs/
+/engines/indextts2/source.zip
