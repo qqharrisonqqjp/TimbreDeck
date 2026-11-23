@@ -35,11 +35,32 @@ def gpt(q, ref, output):
     sf.write(output, samples, rate, subtype="PCM_16")
 
 
+def load_cosy_cpu(model, llm_path, flow_path, hift_path):
+    """Load the official float32 checkpoints without allocating duplicate tensors."""
+    import torch
+
+    for module, path in ((model.llm, llm_path), (model.flow, flow_path), (model.hift, hift_path)):
+        state = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
+        if module is model.hift:
+            state = {key.removeprefix("generator."): value for key, value in state.items()}
+        module.load_state_dict(state, strict=True, assign=True)
+        module.eval()
+
+
 def cosy(q, ref, output):
     import soundfile as sf
     from cosyvoice.cli.cosyvoice import CosyVoice3
 
-    model = CosyVoice3(model_dir="pretrained_models/Fun-CosyVoice3-0.5B")
+    import torch
+    model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"
+    if torch.cuda.is_available():
+        model = CosyVoice3(model_dir=model_dir)
+    else:
+        from unittest.mock import patch
+        from cosyvoice.cli.model import CosyVoice3Model
+
+        with patch.object(CosyVoice3Model, "load", load_cosy_cpu):
+            model = CosyVoice3(model_dir=model_dir)
     options = dict(stream=False, speed=q["speed"])
     prefix = "You are a helpful assistant."
     end = "<|endofprompt|>"

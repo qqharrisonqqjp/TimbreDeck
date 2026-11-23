@@ -100,6 +100,7 @@ def fixtures(root):
             target.symlink_to(sys.executable)
         file(pkg / "soundfile.py", SOUNDFILE)
         if engine == "cosyvoice3":
+            file(pkg / "torch.py", "class cuda:\n    is_available = staticmethod(lambda: True)\n")
             file(pkg / "cosyvoice/cli/cosyvoice.py", COSY)
         else:
             file(pkg / "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin", "test fixture")
