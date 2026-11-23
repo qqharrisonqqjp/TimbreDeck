@@ -1,0 +1,373 @@
+:root {
+  color-scheme: dark;
+  --bg: #141516;
+  --panel: #1d1e20;
+  --line: #36383b;
+  --muted: #b1b3b6;
+  --ink: #f3f1eb;
+  --accent: #f4bb76;
+  font-family: "Segoe UI", "Microsoft JhengHei", "PingFang TC", sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+}
+body[data-engine="cosyvoice3"] {
+  --accent: #94d8bd;
+}
+body[data-engine="voxcpm2"] {
+  --accent: #b4c9f5;
+}
+body[data-engine="indextts2"] {
+  --accent: #e5a4a4;
+}
+body[data-engine="qwen3-tts"] {
+  --accent: #c4acf0;
+}
+header {
+  border-bottom: 1px solid var(--line);
+  background: #1a1b1c;
+}
+.top,
+main {
+  max-width: 1280px;
+  margin: auto;
+  padding: 0 clamp(18px, 4.8vw, 70px);
+}
+.top {
+  min-height: 78px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  font-size: 25px;
+}
+.brand small {
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+.mark {
+  font: 700 22px/1 monospace;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 7px;
+  padding: 6px 4px;
+  letter-spacing: -4px;
+  width: 32px;
+}
+nav,
+.actions,
+.row,
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#switcher {
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 4px;
+}
+button,
+select,
+.linkbtn,
+.filebtn {
+  background: #27292b;
+  border: 1px solid #45474b;
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 9px 13px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+button:hover,
+.filebtn:hover,
+.linkbtn:hover {
+  border-color: var(--accent);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+#switcher button,
+#tabs button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+}
+#switcher button[aria-pressed="true"] {
+  background: #373839;
+  color: var(--ink);
+}
+#compact {
+  display: none;
+}
+.headline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 45px 0 26px;
+  gap: 10px;
+}
+h1 {
+  font-size: clamp(32px, 5vw, 57px);
+  font-weight: 650;
+  letter-spacing: -0.055em;
+  line-height: 1.06;
+  margin: 0 0 9px;
+}
+.headline p,
+.hint,
+#saved,
+.empty,
+p {
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 14px;
+  margin: 5px 0;
+}
+.state {
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: 30px;
+  padding: 6px 11px;
+  white-space: nowrap;
+}
+.state:before {
+  content: "●";
+  color: var(--accent);
+  margin-right: 8px;
+}
+#tabs {
+  border-bottom: 1px solid var(--line);
+  margin: 0 0 23px;
+  gap: 24px;
+}
+#tabs button {
+  padding: 8px 0 13px;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+#tabs button[aria-current="page"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.28fr) minmax(0, 1fr);
+  gap: 15px;
+  align-items: start;
+}
+.card {
+  padding: clamp(18px, 2.5vw, 30px);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  margin-bottom: 15px;
+}
+h2,
+h3 {
+  margin: 0 0 17px;
+}
+h2 {
+  font-size: 21px;
+  letter-spacing: -0.015em;
+}
+h3 {
+  font-size: 16px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 14px 0;
+}
+.field > span,
+.label {
+  font-size: 14px;
+  font-weight: 600;
+}
+textarea,
+input:not([type="file"]),
+select {
+  width: 100%;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: #151617;
+  border: 1px solid #45474b;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+#text {
+  min-height: 180px;
+}
+.row {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.row > .field {
+  flex: 1;
+  min-width: 125px;
+}
+.actions {
+  flex-wrap: wrap;
+  margin-top: 17px;
+}
+.primary {
+  background: var(--accent);
+  color: #191a1b;
+  font-weight: 700;
+  border-color: transparent;
+}
+.linkbtn {
+  text-decoration: none;
+  display: inline-block;
+}
+.filebtn {
+  display: inline-block;
+}
+.filebtn input {
+  max-width: 100%;
+  font-size: 14px;
+}
+.filebtn input::file-selector-button {
+  font: inherit;
+  background: transparent;
+  color: var(--ink);
+  border: 0;
+  border-right: 1px solid var(--line);
+  padding: 0 10px 0 0;
+  margin-right: 10px;
+  cursor: pointer;
+}
+audio {
+  width: 100%;
+  height: 36px;
+  margin: 12px 0 0;
+}
+.path,
+code {
+  overflow-wrap: anywhere;
+}
+.path {
+  color: var(--accent);
+  font-family: Consolas, monospace;
+  font-size: 14px;
+}
+.stack > p {
+  margin: 10px 0;
+}
+.notice,
+#job:not(:empty),
+#notice:not(:empty) {
+  padding: 12px 15px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  background: #252629;
+  color: var(--ink);
+  font-size: 14px;
+  margin-bottom: 15px;
+  line-height: 1.6;
+}
+#job button {
+  margin-left: 12px;
+}
+.history-actions {
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.history-actions audio {
+  max-width: 420px;
+}
+.history-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.meta {
+  font-size: 13px;
+}
+.file-name {
+  overflow-wrap: anywhere;
+}
+#saved {
+  margin-bottom: 35px;
+}
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (max-width: 900px) {
+  #switcher {
+    display: none;
+  }
+  #compact {
+    display: block;
+    width: auto;
+    max-width: 46%;
+    font-size: 13px;
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  .top {
+    min-height: 62px;
+  }
+  .headline {
+    margin-top: 29px;
+  }
+  .card {
+    margin-bottom: 10px;
+  }
+}
+@media (max-width: 520px) {
+  .headline {
+    align-items: flex-start;
+  }
+  .brand {
+    font-size: 20px;
+  }
+  .brand small {
+    font-size: 12px;
+  }
+  .top {
+    gap: 6px;
+  }
+  .state {
+    font-size: 11px;
+  }
+  #tabs {
+    gap: 20px;
+  }
+  .history-actions audio {
+    max-width: 100%;
+  }
+  h1 {
+    font-size: 33px;
+  }
+}

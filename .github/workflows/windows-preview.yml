@@ -1,0 +1,67 @@
+name: Windows portable preview
+on:
+  push:
+    branches: [main]
+    paths: ['studio/**', 'go.mod', 'tests/smoke.py', '.github/workflows/windows-preview.yml']
+  pull_request:
+    paths: ['studio/**', 'go.mod', 'tests/smoke.py', '.github/workflows/windows-preview.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: go test ./...
+      - run: go build -trimpath -ldflags="-s -w" -o Start.exe ./studio
+      - run: python tests/smoke.py Start.exe
+      - id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content studio/VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+-preview\.\d+$') { throw "Invalid preview version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $changed = git diff HEAD^ HEAD --name-only -- studio/VERSION
+          if ($changed -or $env:GITHUB_EVENT_NAME -eq "workflow_dispatch") { "publish=true" >> $env:GITHUB_OUTPUT }
+      - shell: pwsh
+        run: |
+          Compress-Archive -Path Start.exe -DestinationPath TimbreDeck-Windows-x64.zip
+          (Get-FileHash TimbreDeck-Windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  TimbreDeck-Windows-x64.zip" | Set-Content SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-preview
+          path: |
+            TimbreDeck-Windows-x64.zip
+            SHA256SUMS.txt
+  preview-release:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-preview
+      - name: Publish verified launcher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gh release create "v$VERSION" TimbreDeck-Windows-x64.zip SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "TimbreDeck 聲台 v$VERSION" \
+            --notes "Windows x64 啟動器預覽版。解壓後雙擊 Start.exe。可連接已有的 GPT-SoVITS v2Pro 或 CosyVoice 3 環境。引擎包及模型權重另行發佈。已測試啟動及模擬引擎流程，真實模型的 Windows GPU 合成仍待驗證。"

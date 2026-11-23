@@ -6,8 +6,11 @@ English | A portable multi-engine speech studio for Windows. Select an engine, t
 
 ## 專案狀態 · Project status
 
-本版收錄設計規格及鎖定版本的引擎原始碼，Windows 啟動器與引擎包待開發和實測。
-This planning snapshot includes the specification and pinned engine sources. The launcher and Windows runtime packs are scheduled deliverables.
+Windows x64 啟動器預覽版已加入。本機工作室可匯入 WAV、分開保存各引擎的設定、試讀第一句、生成全文、取消作業，以及從輸出歷史試聽或匯出。GPT-SoVITS v2Pro 與 CosyVoice 3 已有合成介接程式，使用時需要完整本機環境。其餘三款引擎及訓練仍在規劃中。這一版的自動測試以測試替身驗證流程，真實模型的 Windows 顯示卡推理尚待驗收。
+
+**[下載 Windows 預覽版 / Windows previews](https://github.com/qqharrisonqqjp/TimbreDeck/releases)** · [啟動及引擎設定 / Getting started](docs/PREVIEW.md)
+
+The preview includes a standalone Windows x64 launcher and a local studio for drafting, reference WAV import, synthesis jobs, playback and export. The GPT-SoVITS and CosyVoice adapters require complete local engine installations. Windows GPU inference with real weights is pending. The other engines and training are planned.
 
 | Engine | 預定工作流程 / Planned workflow |
 |---|---|

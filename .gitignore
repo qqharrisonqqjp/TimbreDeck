@@ -8,3 +8,6 @@
 /cache/
 /logs/
 /engines/indextts2/source.zip
+/config/
+/Start.exe
+__pycache__/
