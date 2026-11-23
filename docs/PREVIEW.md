@@ -27,6 +27,16 @@ python tests/smoke.py Start.exe
 
 Run `Start.exe -no-browser -data "D:\TimbreDeck Data"` for an explicit workspace. The server binds an ephemeral IPv4 loopback port. The launcher has no third-party Go dependencies. The smoke test uses instrumented engine fixtures to check the real launcher, both adapters, four synthesis modes and WAV export. Listening tests with real model weights and target hardware are a separate release criterion for engine packs.
 
+## 用真實引擎作粵語對照
+
+`tests/acceptance.py` 透過啟動器的本機介面匯入同一段錄音，向已安裝的引擎提交相同台詞，再從輸出歷史的下載介面取得 WAV。請使用 3 至 10 秒的單人粵語錄音，第二個文字參數填入錄音的實際逐字稿。輸出資料夾須使用新名稱。
+
+```powershell
+python tests/acceptance.py .\Start.exe .\reference.wav "今日天氣幾好，我哋一齊出去行吓。" .\run-01 --gpt "D:\Engines\GPT-SoVITS" --cosy "D:\Engines\CosyVoice3" --text "今晚八點半喺旺角站等。"
+```
+
+只傳入其中一個引擎路徑也可測試。每個成功的引擎會輸出以引擎命名的 WAV。`comparison.json` 記錄輸入及輸出雜湊、取樣率、長度、峰值、耗時及失敗原因。報告的 generated 代表已取得有訊號的音檔；粵語讀音、語尾及音色相似度須另外試聽。
+
 ## Engine pack publishing
 
 Prepare a tested engine root with the above layout, third-party license notices, matching source revisions, complete offline weights, and its portable interpreter and dependencies. Package from a separate output directory:

@@ -165,6 +165,19 @@ func required(engine string) []string {
 		"pretrained_models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx",
 	}
 }
+
+// Source archives can contain Git LFS pointers in place of actual weights.
+func installedFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
+	if info.Size() > 1024 {
+		return true
+	}
+	data, err := os.ReadFile(path)
+	return err == nil && !strings.HasPrefix(string(data), "version https://git-lfs.github.com/spec/v1")
+}
 func (s *studio) inspect(engine string, paths map[string]string) installation {
 	p := paths[engine]
 	if !filepath.IsAbs(p) {
@@ -175,8 +188,7 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 		return v
 	}
 	for _, f := range required(engine) {
-		i, e := os.Stat(filepath.Join(p, f))
-		if e != nil || !i.Mode().IsRegular() || i.Size() == 0 {
+		if !installedFile(filepath.Join(p, f)) {
 			v.Missing = append(v.Missing, f)
 		}
 	}

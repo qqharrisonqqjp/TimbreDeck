@@ -176,6 +176,9 @@ func (s *studio) validate(q *request) error {
 			return errors.New("GPT-SoVITS 需要 3 至 10 秒的參考錄音。")
 		}
 	case "cosyvoice3":
+		if secs > 30 {
+			return errors.New("CosyVoice 3 的參考錄音最長為 30 秒。")
+		}
 		if q.Mode != "clone" && q.Mode != "instruct" && q.Mode != "cross" {
 			return errors.New("未知的 CosyVoice 模式。")
 		}

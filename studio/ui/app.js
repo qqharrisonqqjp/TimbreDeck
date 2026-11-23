@@ -241,7 +241,7 @@ function synthesis() {
     field("參考錄音（WAV）", el("span", { className: "filebtn" }, ref)),
   ];
   right.push(
-    hint(gpt ? "使用 3 至 10 秒的單人錄音。" : "選用清晰的單人錄音。"),
+    hint(gpt ? "使用 3 至 10 秒的單人錄音。" : "使用最多 30 秒的清晰單人錄音。"),
   );
   if (draft.reference)
     right.push(

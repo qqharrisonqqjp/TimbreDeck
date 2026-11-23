@@ -265,3 +265,14 @@ func TestInstallAndPreservePreviousRuntime(t *testing.T) {
 		}
 	}
 }
+
+func TestLFSPlaceholder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.pt")
+	pointer := "version https://git-lfs.github.com/spec/v1\noid sha256:" + strings.Repeat("a", 64) + "\nsize 123456\n"
+	if err := os.WriteFile(path, []byte(pointer), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if installedFile(path) {
+		t.Fatal("Git LFS pointer accepted as installed weights")
+	}
+}
