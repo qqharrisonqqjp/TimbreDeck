@@ -1,0 +1,38 @@
+# TimbreDeck 聲台 · Windows 預覽版
+
+## 開始使用
+
+1. 從 [Releases（發佈頁）](https://github.com/qqharrisonqqjp/TimbreDeck/releases) 下載 `TimbreDeck-Windows-x64.zip`，解壓到自己可寫入的資料夾。雙擊 `Start.exe`。啟動器會開啟預設瀏覽器。工作期間保留主控台，若瀏覽器未自動開啟，可複製主控台顯示的本機網址。
+2. 在右上角選 GPT-SoVITS 或 CosyVoice 3，開啟「模型管理」。可連接已有的完整引擎資料夾，或把它放進下表的預設位置再按「重新偵測」。顯示「已找到引擎檔案」代表已找到檢查項目，首次合成才會載入模型。大型引擎包仍待發佈。
+3. 回到「語音合成」並匯入參考 WAV。GPT-SoVITS 需要 3 至 10 秒的清晰錄音。錄音複製需填寫正確逐字稿。CosyVoice 的指令朗讀模式另有「講法指示」，例如「請用廣東話，節奏稍慢」。
+4. 在「要讀出的文字」填寫新的台詞，選擇「試讀第一句」或「生成全文」。作業期間可以切換畫面，或按「取消作業」。在「輸出歷史」可預聽並匯出 WAV。每次合成使用獨立引擎程序，載入模型需時。完成或取消後會結束該程序。
+5. 主控台按 Ctrl+C 結束。複製整個資料夾可帶走草稿、匯入錄音和輸出。外接的引擎若搬遷，請重新指定路徑。
+
+| 引擎 | 預設資料夾（相對於 Start.exe） | 資料夾內容 |
+|---|---|---|
+| GPT-SoVITS | `runtimes/gpt-sovits/` | `runtime/python.exe` 與相容依賴、固定版本的 `GPT_SoVITS/` 及配套模型，包含 v2Pro 聲碼器、s1v3、中文語音與文字編碼器、說話者嵌入模型。 |
+| CosyVoice 3 | `runtimes/cosyvoice3/` | `runtime/python.exe` 與相容依賴、固定版本的 `cosyvoice/`、`third_party/Matcha-TTS/`，以及 `pretrained_models/Fun-CosyVoice3-0.5B/` 下的完整 Fun-CosyVoice3-0.5B-2512 模型與配套資源。 |
+
+專案的 [engines/](../engines/README.md) 存放固定版本原始碼。啟動器內置網頁及介接程式。主程式與語音模型分開派發。工作資料寫到啟動器旁邊的 `config/`、`voices/`、`outputs/`、`cache/` 和 `logs/`。執行記錄以作業編號命名。可用的 Windows 顯示卡驅動及每個引擎需要的依賴由對應執行環境提供。
+
+## Build and verify
+
+With Go 1.23+ and Python 3.10+ available to the developer:
+
+```powershell
+go test ./...
+go build -trimpath -ldflags="-s -w" -o Start.exe ./studio
+python tests/smoke.py Start.exe
+```
+
+Run `Start.exe -no-browser -data "D:\TimbreDeck Data"` for an explicit workspace. The server binds an ephemeral IPv4 loopback port. The launcher has no third-party Go dependencies. The smoke test uses instrumented engine fixtures to check the real launcher, both adapters, four synthesis modes and WAV export. Listening tests with real model weights and target hardware are a separate release criterion for engine packs.
+
+## Engine pack publishing
+
+Prepare a tested engine root with the above layout, third-party license notices, matching source revisions, complete offline weights, and its portable interpreter and dependencies. Package from a separate output directory:
+
+```powershell
+python tools/make_pack.py gpt-sovits 1.0.0-nvidia "D:\Builds\GPT-SoVITS" "D:\Packs"
+```
+
+Upload the versioned ZIP parts to this repository's release tagged `packs-v1`. Upload the engine JSON manifest last. Use a new version for changed packages. The launcher displays compressed and expanded sizes and available space, resumes downloads, verifies each part and the entire archive, then extracts into a staging directory. Only a complete install switches the selected runtime. No pack is bundled with the launcher preview.
