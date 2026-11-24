@@ -306,6 +306,9 @@ func (s *studio) routes(host string) http.Handler {
 	})
 	m.HandleFunc("GET /api/pack/{engine}", s.packInfo)
 	m.HandleFunc("POST /api/install/{engine}", s.install)
+	m.HandleFunc("POST /api/import-pack/{engine}", s.importPack)
+	m.HandleFunc("GET /api/installed-packs/{engine}", s.installedPacks)
+	m.HandleFunc("POST /api/installed-packs/{engine}", s.selectPack)
 	ui, _ := fs.Sub(assets, "ui")
 	m.Handle("GET /", http.FileServer(http.FS(ui)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

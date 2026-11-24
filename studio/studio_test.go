@@ -206,12 +206,8 @@ func TestWorkspaceLock(t *testing.T) {
 	}
 }
 
-func TestInstallAndPreservePreviousRuntime(t *testing.T) {
-	s, err := openStudio(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	engine := "gpt-sovits"
+func fixturePack(t *testing.T, engine, version, contents string) (manifest, map[string][]byte) {
+	t.Helper()
 	var archive bytes.Buffer
 	writer := zip.NewWriter(&archive)
 	files := required(engine)
@@ -220,24 +216,37 @@ func TestInstallAndPreservePreviousRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = io.WriteString(f, "x"); err != nil {
+		if _, err = io.WriteString(f, contents); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err = writer.Close(); err != nil {
+	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
 	digest := func(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 	data := archive.Bytes()
 	chunks := [][]byte{data[:25], data[25:]}
 	byName := map[string][]byte{}
-	p := manifest{Engine: engine, Version: "1-test", Expanded: int64(len(files)), Hash: digest(data)}
+	p := manifest{Engine: engine, Version: version, Expanded: int64(len(files) * len(contents)), Hash: digest(data)}
 	for i, b := range chunks {
 		name := fmt.Sprintf("%s-%s.zip.%03d", engine, p.Version, i+1)
-		byName["/"+name] = b
+		byName[name] = b
 		p.Parts = append(p.Parts, part{name, int64(len(b)), digest(b)})
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(byName[r.URL.Path]) }))
+	return p, byName
+}
+
+func TestInstallAndPreservePreviousRuntime(t *testing.T) {
+	s, err := openStudio(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := "gpt-sovits"
+	p, byName := fixturePack(t, engine, "1-test", "x")
+	expected := "pack-" + p.Hash[:16]
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(byName[strings.TrimPrefix(r.URL.Path, "/")])
+	}))
 	defer server.Close()
 	for _, corrupt := range []bool{false, true} {
 		ctx, _, ok := s.reserve(engine, "install")
@@ -259,10 +268,93 @@ func TestInstallAndPreservePreviousRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected := "pack-" + digest(data)[:16]
 		if paths[engine] != expected || !s.inspect(engine, paths).Ready {
 			t.Fatal("previous working installation lost", paths)
 		}
+	}
+}
+
+func TestImportAndSwitchLocalPacks(t *testing.T) {
+	s, err := openStudio(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const host = "127.0.0.1:4321"
+	const engine = "gpt-sovits"
+	h := s.routes(host)
+	call := func(method, path string, data any, status int) []byte {
+		t.Helper()
+		body, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(method, "http://"+host+"/api/"+path, bytes.NewReader(body))
+		r.Header.Set("X-TimbreDeck", "1")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != status {
+			t.Fatalf("%s %s: %d %s", method, path, w.Code, w.Body)
+		}
+		return w.Body.Bytes()
+	}
+	importVersion := func(p manifest, parts map[string][]byte, expected string) {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "聲台 packs")
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		manifestPath := filepath.Join(dir, engine+".json")
+		if err := writeJSON(manifestPath, p); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range parts {
+			if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var submitted job
+		if err := json.Unmarshal(call("POST", "import-pack/"+engine, map[string]string{"path": manifestPath}, 202), &submitted); err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			var current job
+			if err := json.Unmarshal(call("GET", "job", nil, 200), &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.ID != submitted.ID {
+				t.Fatal("unexpected job", current)
+			}
+			if current.Status == "running" {
+				continue
+			}
+			if current.Status != expected {
+				t.Fatal("unexpected status", current)
+			}
+			return
+		}
+		t.Fatal("installation did not finish")
+	}
+	first, firstParts := fixturePack(t, engine, "1-test", "1")
+	second, secondParts := fixturePack(t, engine, "2-test", "2")
+	importVersion(first, firstParts, "done")
+	importVersion(second, secondParts, "done")
+	corrupted := second
+	corrupted.Parts = append([]part(nil), second.Parts...)
+	corrupted.Parts[0].Hash = strings.Repeat("0", 64)
+	importVersion(corrupted, secondParts, "failed")
+	paths, err := s.paths()
+	if err != nil || paths[engine] != "pack-"+second.Hash[:16] {
+		t.Fatal("failed import changed active runtime", paths, err)
+	}
+	list := string(call("GET", "installed-packs/"+engine, nil, 200))
+	if !strings.Contains(list, `"version":"1-test","active":false`) || !strings.Contains(list, `"version":"2-test","active":true`) {
+		t.Fatal("missing version or active selection", list)
+	}
+	id := "pack-" + first.Hash[:16]
+	call("POST", "installed-packs/"+engine, map[string]string{"id": id}, 200)
+	paths, err = s.paths()
+	if err != nil || paths[engine] != id {
+		t.Fatal("previous runtime was not selected", paths, err)
 	}
 }
 

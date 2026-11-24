@@ -20,6 +20,9 @@ import (
 const packURL = "https://github.com/qqharrisonqqjp/TimbreDeck/releases/download/"
 
 var assetName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$`)
+var installedPackName = regexp.MustCompile(`^pack-[a-f0-9]{16}(-[a-f0-9]{8})?$`)
+
+const packMetadata = ".timbredeck-pack.json"
 
 type part struct {
 	Name string `json:"name"`
@@ -71,8 +74,20 @@ func fetchManifest(ctx context.Context, engine string) (manifest, error) {
 	if resp.StatusCode != 200 {
 		return p, fmt.Errorf("讀取發佈清單失敗（HTTP %d）。", resp.StatusCode)
 	}
-	if e = json.NewDecoder(io.LimitReader(resp.Body, 128<<10)).Decode(&p); e != nil {
-		return p, e
+	return readManifest(resp.Body, engine)
+}
+
+func readManifest(r io.Reader, engine string) (manifest, error) {
+	var p manifest
+	data, err := io.ReadAll(io.LimitReader(r, (128<<10)+1))
+	if err != nil {
+		return p, err
+	}
+	if len(data) > 128<<10 {
+		return p, errors.New("引擎包清單超出大小限制。")
+	}
+	if err = json.Unmarshal(data, &p); err != nil {
+		return p, err
 	}
 	return p, p.check(engine)
 }
@@ -111,6 +126,119 @@ func (s *studio) install(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() { s.finish(s.installPack(ctx, p, packURL+"packs-v1/")) }()
 	send(w, 202, j)
+}
+
+func (s *studio) importPack(w http.ResponseWriter, r *http.Request) {
+	engine := r.PathValue("engine")
+	var in struct{ Path string }
+	if !decode(w, r, &in) {
+		return
+	}
+	if !supported(engine) || !filepath.IsAbs(in.Path) {
+		fail(w, 400, "請輸入引擎包 JSON 清單的完整路徑。")
+		return
+	}
+	info, err := os.Stat(in.Path)
+	if err != nil || !info.Mode().IsRegular() {
+		fail(w, 422, "找不到引擎包清單。")
+		return
+	}
+	file, err := os.Open(in.Path)
+	if err != nil {
+		fail(w, 422, err.Error())
+		return
+	}
+	p, err := readManifest(file, engine)
+	file.Close()
+	if err != nil {
+		fail(w, 422, err.Error())
+		return
+	}
+	ctx, j, ok := s.reserve(engine, "install")
+	if !ok {
+		fail(w, 409, "已有作業進行中。")
+		return
+	}
+	go func() { s.finish(s.installLocalPack(ctx, p, filepath.Dir(in.Path))) }()
+	send(w, 202, j)
+}
+
+func (s *studio) installedPacks(w http.ResponseWriter, r *http.Request) {
+	engine := r.PathValue("engine")
+	if !supported(engine) {
+		fail(w, 404, "此引擎尚未接通。")
+		return
+	}
+	parent := s.path("runtimes", engine)
+	s.files.Lock()
+	defer s.files.Unlock()
+	paths, err := s.paths()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil && !os.IsNotExist(err) {
+		fail(w, 500, err.Error())
+		return
+	}
+	type version struct {
+		ID      string `json:"id"`
+		Version string `json:"version,omitempty"`
+		Active  bool   `json:"active"`
+	}
+	versions := []version{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || !installedPackName.MatchString(name) ||
+			!s.inspect(engine, map[string]string{engine: name}).Ready {
+			continue
+		}
+		v := version{ID: name, Active: paths[engine] == name}
+		var p manifest
+		if readJSON(filepath.Join(parent, name, packMetadata), &p) == nil && p.check(engine) == nil {
+			v.Version = p.Version
+		}
+		versions = append(versions, v)
+	}
+	send(w, 200, versions)
+}
+
+func (s *studio) selectPack(w http.ResponseWriter, r *http.Request) {
+	engine := r.PathValue("engine")
+	var in struct{ ID string }
+	if !decode(w, r, &in) {
+		return
+	}
+	if !supported(engine) || !installedPackName.MatchString(in.ID) {
+		fail(w, 400, "請選擇已安裝的引擎包。")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active != nil && (s.active.Status == "running" || s.active.Status == "cancelling") {
+		fail(w, 409, "已有作業進行中。")
+		return
+	}
+	s.files.Lock()
+	defer s.files.Unlock()
+	info, err := os.Lstat(s.path("runtimes", engine, in.ID))
+	v := s.inspect(engine, map[string]string{engine: in.ID})
+	if err != nil || !info.IsDir() || !v.Ready {
+		fail(w, 422, "引擎包缺少必要檔案。")
+		return
+	}
+	paths, err := s.paths()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	paths[engine] = in.ID
+	if err = writeJSON(s.path("config", "engines.json"), paths); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	send(w, 200, v)
 }
 func verify(ctx context.Context, path, hash string) bool {
 	f, e := os.Open(path)
@@ -291,6 +419,44 @@ func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) er
 			need -= min(st.Size(), v.Size)
 		}
 	}
+	err := s.installFromParts(ctx, p, need, func(v part) (*os.File, error) {
+		path := filepath.Join(cache, v.Name)
+		if err := downloadPart(ctx, baseURL+v.Name, path, v); err != nil {
+			return nil, err
+		}
+		return os.Open(path)
+	})
+	if err == nil {
+		os.RemoveAll(cache)
+	}
+	return err
+}
+
+func (s *studio) installLocalPack(ctx context.Context, p manifest, source string) error {
+	return s.installFromParts(ctx, p, p.Expanded, func(v part) (*os.File, error) {
+		path := filepath.Join(source, v.Name)
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != v.Size {
+			return nil, fmt.Errorf("缺少分卷或大小不符：%s", v.Name)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		h := sha256.New()
+		n, err := io.Copy(h, checkingReader{ctx, io.NewSectionReader(f, 0, v.Size)})
+		if err != nil || n != v.Size || hex.EncodeToString(h.Sum(nil)) != v.Hash {
+			f.Close()
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("分卷校驗不符：%s", v.Name)
+		}
+		return f, nil
+	})
+}
+
+func (s *studio) installFromParts(ctx context.Context, p manifest, need int64, open func(part) (*os.File, error)) error {
 	free, e := freeSpace(s.root)
 	if e != nil {
 		return e
@@ -298,7 +464,7 @@ func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) er
 	if free < need {
 		return errors.New("磁碟可用空間不足。")
 	}
-	parts := segments{}
+	var parts segments
 	defer func() {
 		for _, p := range parts {
 			p.f.Close()
@@ -306,12 +472,8 @@ func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) er
 	}()
 	var off int64
 	for i, v := range p.Parts {
-		s.detail(fmt.Sprintf("下載及校驗第 %d / %d 卷", i+1, len(p.Parts)))
-		path := filepath.Join(cache, v.Name)
-		if e = downloadPart(ctx, baseURL+v.Name, path, v); e != nil {
-			return e
-		}
-		f, e := os.Open(path)
+		s.detail(fmt.Sprintf("讀取及校驗第 %d / %d 卷", i+1, len(p.Parts)))
+		f, e := open(v)
 		if e != nil {
 			return e
 		}
@@ -341,6 +503,9 @@ func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) er
 	if !s.inspect(p.Engine, map[string]string{p.Engine: stage}).Ready {
 		return errors.New("引擎包缺少必要檔案。")
 	}
+	if e = writeJSON(filepath.Join(stage, packMetadata), p); e != nil {
+		return e
+	}
 	if e = ctx.Err(); e != nil {
 		return e
 	}
@@ -362,13 +527,5 @@ func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) er
 		}
 	}
 	paths[p.Engine] = name
-	if e = writeJSON(s.path("config", "engines.json"), paths); e != nil {
-		return e
-	}
-	for _, part := range parts {
-		part.f.Close()
-	}
-	parts = nil
-	os.RemoveAll(cache)
-	return nil
+	return writeJSON(s.path("config", "engines.json"), paths)
 }

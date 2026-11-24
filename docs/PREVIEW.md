@@ -50,3 +50,5 @@ python tools/make_pack.py gpt-sovits 1.0.0-nvidia "D:\Builds\GPT-SoVITS" "D:\Pac
 ```
 
 Upload the versioned ZIP parts to this repository's release tagged `packs-v1`. Upload the engine JSON manifest last. Use a new version for changed packages. The launcher displays compressed and expanded sizes and available space, resumes downloads, verifies each part and the entire archive, then extracts into a staging directory. Only a complete install switches the selected runtime. No pack is bundled with the launcher preview.
+
+離線安裝時，將 JSON 清單與全部分卷放在同一資料夾。在「模型管理」選對應引擎，於「匯入本機引擎包」輸入清單的完整路徑，再按「校驗並安裝」。安裝會直接讀取分卷。已安裝的版本出現在同一面板，可切回先前版本。

@@ -383,6 +383,40 @@ function models() {
     box("actions", btn("檢查可下載版本", lookup)),
     info,
   );
+  const manifest = el("input", {
+    type: "text",
+    id: "manifest",
+    placeholder: "D:\\Packs\\gpt-sovits.json",
+  });
+  const versions = el("div", { className: "stack" });
+  api("installed-packs/" + k)
+    .then((packs) => {
+      if (!packs.length) return;
+      versions.replaceChildren(
+        el("h3", {}, "已安裝版本"),
+        ...packs.map((pack) => {
+          const label = pack.version || pack.id;
+          if (pack.active) return hint(label + " · 使用中");
+          return btn("切換至 " + label, async () => {
+            engines[k] = await api("installed-packs/" + k, "POST", { id: pack.id });
+            render();
+            notice("已切換引擎包。");
+          });
+        }),
+      );
+    })
+    .catch((e) => { versions.textContent = e.message; });
+  const localPack = card(
+    "匯入本機引擎包",
+    hint("把 JSON 清單和所有分卷放在同一資料夾。"),
+    field("JSON 清單完整路徑", manifest),
+    btn("校驗並安裝", async () => {
+      if (!manifest.value.trim()) throw Error("請輸入 JSON 清單完整路徑。");
+      currentJob = await api("import-pack/" + k, "POST", { path: manifest.value.trim() });
+      showJob();
+    }),
+    versions,
+  );
   const folder = card(
     "連接現有引擎",
     hint(
@@ -420,7 +454,7 @@ function models() {
         btn("前往語音合成", () => setTab("synth"), { className: "primary" }),
       ),
     );
-  $("work").replaceChildren(box("grid", folder, about));
+  $("work").replaceChildren(box("grid", folder, box("stack", about, localPack)));
 }
 async function history() {
   const mark = renderID;
