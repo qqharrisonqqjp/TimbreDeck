@@ -20,6 +20,8 @@
 
 VoxCPM2、IndexTTS-2 及 Qwen3-TTS 已完成介接替身測試。請依鎖定的上游版本備齊執行環境與模型，並在實機確認生成及離線能力。[上游版本](../engines/README.md)
 
+Qwen 的三個型號可放在同一引擎根目錄，亦可分別用本機引擎包匯入。生成時優先使用目前選用版本所含的型號，並從已安裝包補齊其他型號。
+
 專案的 [engines/](../engines/README.md) 存放固定版本原始碼。啟動器內置網頁及介接程式。主程式與語音模型分開派發。工作資料寫到啟動器旁邊的 `config/`、`voices/`、`outputs/`、`cache/` 和 `logs/`。執行記錄以作業編號命名。可用的 Windows 顯示卡驅動及每個引擎需要的依賴由對應執行環境提供。
 
 ## Build and verify
@@ -30,9 +32,10 @@ With Go 1.23+ and Python 3.10+ available to the developer:
 go test ./...
 go build -trimpath -ldflags="-s -w" -o Start.exe ./studio
 python tests/smoke.py Start.exe
+python tests/training_tools.py
 ```
 
-Run `Start.exe -no-browser -data "D:\TimbreDeck Data"` for an explicit workspace. The server binds an ephemeral IPv4 loopback port. The launcher has no third-party Go dependencies. The smoke test uses instrumented engine fixtures to check the real launcher, both adapters, four synthesis modes and WAV export. Listening tests with real model weights and target hardware are a separate release criterion for engine packs.
+Run `Start.exe -no-browser -data "D:\TimbreDeck Data"` for an explicit workspace. The server binds an ephemeral IPv4 loopback port. The launcher has no third-party Go dependencies. Fixture tests exercise all five adapters, 15 synthesis modes, WAV export, voice profiles and the training tool contracts. Engine pack validation requires listening tests with real weights and target hardware.
 
 ## 用真實引擎作粵語對照
 
@@ -59,3 +62,16 @@ python tools/make_pack.py gpt-sovits 1.0.0-nvidia "D:\Builds\GPT-SoVITS" "D:\Pac
 Upload the versioned ZIP parts to this repository's release tagged `packs-v1`. Upload the engine JSON manifest last. Use a new version for changed packages. The launcher displays compressed and expanded sizes and available space, resumes downloads, verifies each part and the entire archive, then extracts into a staging directory. Only a complete install switches the selected runtime. No pack is bundled with the launcher preview.
 
 離線安裝時，將 JSON 清單與全部分卷放在同一資料夾。在「模型管理」選對應引擎，於「匯入本機引擎包」輸入清單的完整路徑，再按「校驗並安裝」。安裝會直接讀取分卷。已安裝的版本出現在同一面板，可切回先前版本。
+
+## GPT-SoVITS v2Pro 訓練流程
+
+在「訓練素材」新建專案，匯入 PCM16 WAV。先按停頓自動切片，或自行輸入每段的起訖毫秒。儲存後可逐段預聽。若引擎執行環境已安裝 faster-whisper，可在同一頁使用本機 CTranslate2 模型為空白片段產生候選逐字稿。預設模型路徑為 `GPT_SoVITS/pretrained_models/faster-whisper-large-v3/`，包含模型、設定與 tokenizer。轉錄完成後重新選取專案。校對後將每段標為訓練、保留試聽或剔除，再儲存並匯出。ZIP 的 `dataset.list` 只含訓練片段，`holdout.list` 和 `holdout/` 另存試聽素材。
+
+將資料集 ZIP 解壓，並使用與本倉庫鎖定版本相符、含訓練依賴的 GPT-SoVITS 執行環境。S2 微調另需 v2Pro 的 `s2Dv2Pro.pth`。下例中的 `<project-id>` 就是工作室 `training/` 下該專案的目錄名稱。請將它替換成實際值。
+
+```powershell
+python tools/prepare_gpt_dataset.py "D:\Engines\GPT-SoVITS" "D:\Dataset" "D:\Features" --gpu 0
+python tools/train_gpt_model.py "D:\Engines\GPT-SoVITS" "D:\Features" ".\training\<project-id>\run" --gpu 0 --epochs 8 --batch 2
+```
+
+特徵準備省略 `--gpu` 時走 CPU。微調工具要求執行環境可使用 CUDA。中斷後，以相同引擎、特徵、輸出目錄和參數重跑微調命令，保留已完成的階段與上游檢查點。兩組推理權重完整後，工作室可以在「語音合成」按「重新偵測微調模型」，用同一段保留台詞比較基礎及微調模型，也可把微調模型設定為角色的預設。特徵準備、轉錄、微調交接及模型切換經替身測試，真實權重的訓練和試聽仍待驗收。

@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-//go:embed ui/* worker.py
+//go:embed ui/* worker.py transcribe.py
 var assets embed.FS
 
 type studio struct {
@@ -56,6 +56,7 @@ type installation struct {
 	Ready             bool     `json:"ready"`
 	Missing           []string `json:"missing,omitempty"`
 	AvailableVariants []string `json:"availableVariants,omitempty"`
+	variantPaths      map[string]string
 }
 
 func id() string {
@@ -115,7 +116,7 @@ func openStudio(root string) (*studio, error) {
 	if e != nil {
 		return nil, e
 	}
-	for _, dir := range []string{"config", "voices", "outputs", "logs", "cache", "runtimes"} {
+	for _, dir := range []string{"config", "voices", "outputs", "logs", "cache", "runtimes", "training"} {
 		if e = os.MkdirAll(filepath.Join(abs, dir), 0700); e != nil {
 			return nil, e
 		}
@@ -162,7 +163,7 @@ func required(engine string) []string {
 	case "voxcpm2":
 		return []string{
 			"runtime/python.exe", "src/voxcpm/core.py",
-			"pretrained_models/VoxCPM2/config.json", "pretrained_models/VoxCPM2/tokenizer.json",
+			"pretrained_models/VoxCPM2/config.json", "pretrained_models/VoxCPM2/tokenizer.json|pretrained_models/VoxCPM2/tokenizer.model",
 			"pretrained_models/VoxCPM2/model.safetensors|pretrained_models/VoxCPM2/pytorch_model.bin",
 			"pretrained_models/VoxCPM2/audiovae.safetensors|pretrained_models/VoxCPM2/audiovae.pth",
 		}
@@ -173,10 +174,6 @@ func required(engine string) []string {
 			"checkpoints/wav2vec2bert_stats.pt", "checkpoints/feat1.pt", "checkpoints/feat2.pt",
 			"checkpoints/qwen0.6bemo4-merge/config.json",
 			"checkpoints/qwen0.6bemo4-merge/model.safetensors|checkpoints/qwen0.6bemo4-merge/pytorch_model.bin",
-			"checkpoints/hf_cache/models--facebook--w2v-bert-2.0/refs/main",
-			"checkpoints/hf_cache/models--amphion--MaskGCT/refs/main",
-			"checkpoints/hf_cache/models--funasr--campplus/refs/main",
-			"checkpoints/hf_cache/models--nvidia--bigvgan_v2_22khz_80band_256x/refs/main",
 		}
 	case "qwen3-tts":
 		return []string{"runtime/python.exe", "qwen_tts/inference/qwen3_tts_model.py"}
@@ -201,6 +198,51 @@ func missingFiles(root string, requirements []string) []string {
 	return missing
 }
 
+func missingIndexCaches(root string) []string {
+	requirements := []struct {
+		repo  string
+		files []string
+	}{
+		{"facebook--w2v-bert-2.0", []string{"config.json", "preprocessor_config.json", "model.safetensors|pytorch_model.bin"}},
+		{"amphion--MaskGCT", []string{"semantic_codec/model.safetensors"}},
+		{"funasr--campplus", []string{"campplus_cn_common.bin"}},
+		{"nvidia--bigvgan_v2_22khz_80band_256x", []string{"config.json", "bigvgan_generator.pt"}},
+	}
+	var missing []string
+	for _, repo := range requirements {
+		cache := filepath.Join(root, "checkpoints", "hf_cache", "models--"+repo.repo)
+		content, err := os.ReadFile(filepath.Join(cache, "refs", "main"))
+		ref := strings.TrimSpace(string(content))
+		if err != nil || !hexID(ref, 40) || len(missingFiles(filepath.Join(cache, "snapshots", ref), repo.files)) > 0 {
+			missing = append(missing, "checkpoints/hf_cache/models--"+repo.repo)
+		}
+	}
+	return missing
+}
+
+func modelWeightsAvailable(root string) bool {
+	if installedFile(filepath.Join(root, "model.safetensors")) {
+		return true
+	}
+	var index struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := readJSON(filepath.Join(root, "model.safetensors.index.json"), &index); err != nil || len(index.WeightMap) == 0 {
+		return false
+	}
+	checked := map[string]bool{}
+	for _, shard := range index.WeightMap {
+		if !checked[shard] {
+			if shard != filepath.Base(shard) || !strings.HasSuffix(shard, ".safetensors") ||
+				!installedFile(filepath.Join(root, shard)) {
+				return false
+			}
+			checked[shard] = true
+		}
+	}
+	return true
+}
+
 // Source archives can contain Git LFS pointers in place of actual weights.
 func installedFile(path string) bool {
 	info, err := os.Stat(path)
@@ -223,15 +265,17 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 		return v
 	}
 	v.Missing = missingFiles(p, required(engine))
+	if engine == "indextts2" {
+		v.Missing = append(v.Missing, missingIndexCaches(p)...)
+	}
 	if engine == "qwen3-tts" {
 		for _, variant := range v.Variants {
 			model := filepath.Join(p, "pretrained_models", "Qwen3-TTS-12Hz-1.7B-"+variant)
 			files := []string{
-				"config.json", "model.safetensors|model.safetensors.index.json",
-				"generation_config.json", "tokenizer_config.json", "speech_tokenizer/config.json",
+				"config.json", "generation_config.json", "tokenizer_config.json", "speech_tokenizer/config.json",
 				"speech_tokenizer/model.safetensors",
 			}
-			if len(missingFiles(model, files)) == 0 {
+			if len(missingFiles(model, files)) == 0 && modelWeightsAvailable(model) {
 				v.AvailableVariants = append(v.AvailableVariants, variant)
 			}
 		}
@@ -242,6 +286,44 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 	v.Ready = len(v.Missing) == 0
 	return v
 }
+
+func (s *studio) inspectSelected(engine string, paths map[string]string) installation {
+	v := s.inspect(engine, paths)
+	if engine != "qwen3-tts" {
+		return v
+	}
+	v.variantPaths = map[string]string{}
+	add := func(candidate installation) {
+		if candidate.Ready {
+			for _, variant := range candidate.AvailableVariants {
+				if v.variantPaths[variant] == "" {
+					v.variantPaths[variant] = candidate.Path
+				}
+			}
+		}
+	}
+	add(v)
+	entries, _ := os.ReadDir(s.path("runtimes", engine))
+	for _, entry := range entries {
+		if len(v.variantPaths) == len(v.Variants) {
+			break
+		}
+		if entry.IsDir() && installedPackName.MatchString(entry.Name()) {
+			add(s.inspect(engine, map[string]string{engine: entry.Name()}))
+		}
+	}
+	v.AvailableVariants = nil
+	for _, variant := range v.Variants {
+		if v.variantPaths[variant] != "" {
+			v.AvailableVariants = append(v.AvailableVariants, variant)
+		}
+	}
+	if len(v.AvailableVariants) > 0 {
+		v.Ready, v.Missing = true, nil
+	}
+	return v
+}
+
 func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 	s.files.Lock()
 	defer s.files.Unlock()
@@ -275,7 +357,7 @@ func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 	}
 	inst := map[string]installation{}
 	for k := range engineCatalog {
-		inst[k] = s.inspect(k, paths)
+		inst[k] = s.inspectSelected(k, paths)
 	}
 	send(w, 200, map[string]any{"draft": d, "engines": inst})
 }
@@ -309,7 +391,7 @@ func (s *studio) setPath(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, e.Error())
 		return
 	}
-	send(w, 200, v)
+	send(w, 200, s.inspectSelected(in.Engine, paths))
 }
 func (s *studio) reserve(engine, kind string) (context.Context, job, bool) {
 	s.mu.Lock()
@@ -351,6 +433,14 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("POST /api/profiles", s.saveProfile)
 	m.HandleFunc("PUT /api/profiles/{id}", s.saveProfile)
 	m.HandleFunc("DELETE /api/profiles/{id}", s.removeProfile)
+	m.HandleFunc("GET /api/training", s.trainingProjects)
+	m.HandleFunc("POST /api/training", s.saveTraining)
+	m.HandleFunc("POST /api/training/split", s.splitTrainingClip)
+	m.HandleFunc("PUT /api/training/{id}", s.saveTraining)
+	m.HandleFunc("GET /api/training/{id}/clip/{clip}", s.trainingAudio)
+	m.HandleFunc("GET /api/training/{id}/dataset", s.trainingDataset)
+	m.HandleFunc("POST /api/training/{id}/transcribe", s.trainingTranscribe)
+	m.HandleFunc("GET /api/trained-models", s.trainedModels)
 	m.HandleFunc("POST /api/synthesize", s.synthesize)
 	m.HandleFunc("GET /api/history", s.history)
 	m.HandleFunc("GET /api/audio/{id}", s.audio)

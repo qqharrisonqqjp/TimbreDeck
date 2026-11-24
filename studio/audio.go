@@ -25,65 +25,83 @@ func wavDuration(path string) (float64, error) {
 	return seconds, err
 }
 
+type waveData struct {
+	rate, block, size      uint32
+	format, channels, bits uint16
+	offset                 int64
+}
+
 func wavInfo(path string) (float64, uint32, error) {
-	f, e := os.Open(path)
-	if e != nil {
-		return 0, 0, e
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
 	}
 	defer f.Close()
+	wav, err := parseWAV(f)
+	if err != nil {
+		return 0, 0, err
+	}
+	return float64(wav.size/wav.block) / float64(wav.rate), wav.rate, nil
+}
+
+func parseWAV(f *os.File) (waveData, error) {
 	bad := errors.New("請選用完整的 PCM 或浮點 WAV 音檔。")
 	st, e := f.Stat()
 	if e != nil {
-		return 0, 0, e
+		return waveData{}, e
 	}
 	var h [12]byte
 	if _, e := io.ReadFull(f, h[:]); e != nil || string(h[:4]) != "RIFF" || string(h[8:]) != "WAVE" {
-		return 0, 0, bad
+		return waveData{}, bad
 	}
 	end := int64(binary.LittleEndian.Uint32(h[4:8])) + 8
 	if end > st.Size() {
-		return 0, 0, bad
+		return waveData{}, bad
 	}
-	var rate, block, size uint32
+	var wav waveData
 	for pos := int64(12); pos+8 <= end; {
 		var c [8]byte
 		if _, e = f.ReadAt(c[:], pos); e != nil {
-			return 0, 0, bad
+			return waveData{}, bad
 		}
 		n := binary.LittleEndian.Uint32(c[4:])
 		pos += 8
 		if int64(n) > end-pos {
-			return 0, 0, bad
+			return waveData{}, bad
 		}
 		switch string(c[:4]) {
 		case "fmt ":
 			var b [16]byte
 			if n < 16 {
-				return 0, 0, bad
+				return waveData{}, bad
 			}
 			if _, e = f.ReadAt(b[:], pos); e != nil {
-				return 0, 0, bad
+				return waveData{}, bad
 			}
 			fmtID := binary.LittleEndian.Uint16(b[:])
 			channels := uint32(binary.LittleEndian.Uint16(b[2:]))
 			bits := uint32(binary.LittleEndian.Uint16(b[14:]))
 			if (fmtID != 1 && fmtID != 3) || channels == 0 || channels > 2 || bits == 0 || bits%8 != 0 || bits > 64 {
-				return 0, 0, bad
+				return waveData{}, bad
 			}
-			rate = binary.LittleEndian.Uint32(b[4:])
-			block = uint32(binary.LittleEndian.Uint16(b[12:]))
-			if rate < 8000 || rate > 384000 || block != channels*bits/8 {
-				return 0, 0, bad
+			wav.rate = binary.LittleEndian.Uint32(b[4:])
+			wav.block = uint32(binary.LittleEndian.Uint16(b[12:]))
+			if wav.rate < 8000 || wav.rate > 384000 || wav.block != channels*bits/8 {
+				return waveData{}, bad
 			}
+			wav.format = fmtID
+			wav.channels = uint16(channels)
+			wav.bits = uint16(bits)
 		case "data":
-			size = n
+			wav.size = n
+			wav.offset = pos
 		}
 		pos += int64(n) + int64(n%2)
 	}
-	if rate == 0 || block == 0 || size < block || size%block != 0 {
-		return 0, 0, bad
+	if wav.rate == 0 || wav.block == 0 || wav.size < wav.block || wav.size%wav.block != 0 {
+		return waveData{}, bad
 	}
-	return float64(size) / float64(block) / float64(rate), rate, nil
+	return wav, nil
 }
 
 func (s *studio) reference(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +156,7 @@ type request struct {
 	Reference        string    `json:"reference"`
 	VoiceID          string    `json:"voiceId,omitempty"`
 	Variant          string    `json:"variant,omitempty"`
+	ModelProject     string    `json:"modelProject,omitempty"`
 	Speaker          string    `json:"speaker,omitempty"`
 	EmotionReference string    `json:"emotionReference,omitempty"`
 	EmotionStrength  *float64  `json:"emotionStrength,omitempty"`
@@ -282,9 +301,22 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 		fail(w, 422, e.Error())
 		return
 	}
+	var trained *trainedModel
+	if q.ModelProject != "" {
+		if q.Engine != "gpt-sovits" {
+			fail(w, 422, "微調模型只適用於 GPT-SoVITS。")
+			return
+		}
+		model, err := s.loadTrainedModel(q.ModelProject)
+		if err != nil {
+			fail(w, 422, "找不到可用的 v2Pro 微調模型，請重新偵測。")
+			return
+		}
+		trained = &model
+	}
 	s.files.Lock()
 	paths, e := s.paths()
-	v := s.inspect(q.Engine, paths)
+	v := s.inspectSelected(q.Engine, paths)
 	s.files.Unlock()
 	if e != nil {
 		fail(w, 500, e.Error())
@@ -294,19 +326,23 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, "請先在模型管理連接完整引擎。")
 		return
 	}
-	if q.Engine == "qwen3-tts" && !slices.Contains(v.AvailableVariants, q.Variant) {
-		fail(w, 409, "請先在模型管理連接 "+q.Variant+" 模型。")
-		return
+	root := v.Path
+	if q.Engine == "qwen3-tts" {
+		root = v.variantPaths[q.Variant]
+		if root == "" {
+			fail(w, 409, "請先在模型管理連接 "+q.Variant+" 模型。")
+			return
+		}
 	}
 	ctx, j, ok := s.reserve(q.Engine, "synthesis")
 	if !ok {
 		fail(w, 409, "已有作業進行中。")
 		return
 	}
-	go func() { s.finish(s.render(ctx, j.ID, v.Path, q, voice)) }()
+	go func() { s.finish(s.render(ctx, j.ID, root, q, voice, trained)) }()
 	send(w, 202, j)
 }
-func (s *studio) render(ctx context.Context, key, root string, q request, voice string) error {
+func (s *studio) render(ctx context.Context, key, root string, q request, voice string, trained *trainedModel) error {
 	dir, e := os.MkdirTemp(s.path("outputs"), ".render-*")
 	if e != nil {
 		return e
@@ -323,6 +359,7 @@ func (s *studio) render(ctx context.Context, key, root string, q request, voice 
 	src, _ := assets.ReadFile("worker.py")
 	payload, e := json.Marshal(map[string]any{
 		"id": key, "request": q, "ref": ref, "emotionRef": emotionRef, "output": dst,
+		"trained":     trained,
 		"diagnostics": filepath.Join(dir, "execution.json"),
 	})
 	if e != nil {

@@ -2,9 +2,9 @@ name: Windows portable preview
 on:
   push:
     branches: [main]
-    paths: ['studio/**', 'go.mod', 'tests/**', '.github/workflows/windows-preview.yml']
+    paths: ['studio/**', 'go.mod', 'tests/**', 'tools/**', '.github/workflows/windows-preview.yml']
   pull_request:
-    paths: ['studio/**', 'go.mod', 'tests/**', '.github/workflows/windows-preview.yml']
+    paths: ['studio/**', 'go.mod', 'tests/**', 'tools/**', '.github/workflows/windows-preview.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -28,6 +28,7 @@ jobs:
       - run: go test ./...
       - run: go build -trimpath -ldflags="-s -w" -o Start.exe ./studio
       - run: python tests/smoke.py Start.exe
+      - run: python tests/training_tools.py
       - id: version
         shell: pwsh
         run: |

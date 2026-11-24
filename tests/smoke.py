@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from zipfile import ZipFile
 
 from acceptance import read_execution, require_windows_cuda
 
@@ -39,9 +40,6 @@ MANDATORY = {
         *("checkpoints/" + name for name in
           ("config.yaml", "gpt.pth", "s2mel.pth", "bpe.model", "wav2vec2bert_stats.pt",
            "feat1.pt", "feat2.pt", "qwen0.6bemo4-merge/config.json", "qwen0.6bemo4-merge/model.safetensors")),
-        *(f"checkpoints/hf_cache/models--{repo}/refs/main" for repo in
-          ("facebook--w2v-bert-2.0", "amphion--MaskGCT", "funasr--campplus",
-           "nvidia--bigvgan_v2_22khz_80band_256x")),
     ],
     "qwen3-tts": [
         "qwen_tts/inference/qwen3_tts_model.py",
@@ -63,7 +61,11 @@ class Module:
 GPT = DEVICE_FIXTURE + """
 class TTS_Config:
     default_configs = {"v2Pro": {}}
-    def __init__(self, config): assert not config["custom"]["is_half"]
+    def __init__(self, config):
+        assert not config["custom"]["is_half"]
+        if "t2s_weights_path" in config["custom"]:
+            assert config["custom"]["t2s_weights_path"].endswith("learned.ckpt")
+            assert config["custom"]["vits_weights_path"].endswith("learned.pth")
 class TTS:
     def __init__(self, config):
         self.t2s_model = Module("cpu")
@@ -78,6 +80,18 @@ class TTS:
         assert args["prompt_text"] == "參考。" and args["speed_factor"] in (1, 1.25)
         self.vits_model.decode()
         yield 24000, bytes([1, 0, 2, 0]) * 1200
+"""
+WHISPER = """
+from types import SimpleNamespace
+
+class WhisperModel:
+    supported_languages = ["zh"]
+    def __init__(self, model, **kwargs):
+        assert model.endswith("faster-whisper-large-v3")
+        assert kwargs == {"device": "cpu", "compute_type": "int8", "local_files_only": True}
+    def transcribe(self, path, language):
+        assert path.endswith(".wav") and language == "zh"
+        return iter([SimpleNamespace(text="候選逐字稿。")]), None
 """
 COSY = DEVICE_FIXTURE + """
 class Audio:
@@ -213,6 +227,18 @@ def fixtures(root):
         pkg = root / "runtimes" / engine
         for name in files:
             file(pkg / name, "fixture")
+        if engine == "indextts2":
+            snapshot = "a" * 40
+            for repo, names in {
+                "facebook--w2v-bert-2.0": ("config.json", "preprocessor_config.json", "model.safetensors"),
+                "amphion--MaskGCT": ("semantic_codec/model.safetensors",),
+                "funasr--campplus": ("campplus_cn_common.bin",),
+                "nvidia--bigvgan_v2_22khz_80band_256x": ("config.json", "bigvgan_generator.pt"),
+            }.items():
+                cache = pkg / "checkpoints/hf_cache" / ("models--" + repo)
+                file(cache / "refs/main", snapshot)
+                for name in names:
+                    file(cache / "snapshots" / snapshot / name, "fixture")
         target = pkg / "runtime" / "python.exe"
         target.parent.mkdir()
         if os.name == "nt":
@@ -230,6 +256,9 @@ def fixtures(root):
             file(pkg / "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin", "test fixture")
             file(pkg / "torch.py", TORCH)
             file(pkg / "GPT_SoVITS/TTS_infer_pack/TTS.py", GPT)
+            file(pkg / "faster_whisper.py", WHISPER)
+            for name in ("model.bin", "config.json", "tokenizer.json"):
+                file(pkg / "GPT_SoVITS/pretrained_models/faster-whisper-large-v3" / name, "fixture")
         else:
             adapter_file, adapter = {
                 "voxcpm2": ("src/voxcpm/__init__.py", VOX),
@@ -326,9 +355,19 @@ def check_new_engines(api, root, ref, emotion):
     expect_http_error(api, 422, "/api/synthesize", dict(design, instruction=""))
     expect_http_error(api, 422, "/api/synthesize", dict(common, engine="indextts2",
                       mode="emotion-vector", reference=ref, emotionWeights=[0.2]))
-    for name in ("config.json", "model.safetensors", "generation_config.json", "tokenizer_config.json",
+    qwen_root = root / "runtimes/qwen3-tts"
+    design_pack = qwen_root / ("pack-" + "b"*16)
+    for name in ("runtime", "qwen_tts"):
+        shutil.copytree(qwen_root / name, design_pack / name, symlinks=True)
+    for name in ("torch.py", "soundfile.py"):
+        shutil.copy(qwen_root / name, design_pack / name)
+    for name in ("config.json", "generation_config.json", "tokenizer_config.json",
                  "speech_tokenizer/config.json", "speech_tokenizer/model.safetensors"):
-        file(root / "runtimes/qwen3-tts/pretrained_models/Qwen3-TTS-12Hz-1.7B-VoiceDesign" / name, "fixture")
+        file(design_pack / "pretrained_models/Qwen3-TTS-12Hz-1.7B-VoiceDesign" / name, "fixture")
+    design_model = design_pack / "pretrained_models/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    file(design_model / "model.safetensors.index.json", '{"weight_map":{"tensor":"model-00001-of-00001.safetensors"}}')
+    expect_http_error(api, 409, "/api/synthesize", design)
+    file(design_model / "model-00001-of-00001.safetensors", "fixture")
     for engine, mode, rate, options in cases:
         payload = dict(common, engine=engine, mode=mode, **options)
         key = api("/api/synthesize", payload)["id"]
@@ -351,6 +390,72 @@ def check_new_engines(api, root, ref, emotion):
     api("/api/profiles/" + voice, method="DELETE")
     assert not api("/api/profiles") and api("/api/reference/" + ref)
     assert any(x.get("voiceName") == "粵語角色" for x in api("/api/history"))
+
+
+def check_training(api, root, synthesis_ref):
+    source = io.BytesIO()
+    with wave.open(source, "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "NONE"))
+        wav.writeframes(b"\x00\x08" * 8000 + bytes(32000) + b"\x00\x08" * 8000)
+    ref = api("/api/reference", source.getvalue())["id"]
+    clip = dict(reference=ref, sourceName="試錄.wav", startMs=0, endMs=2000,
+                language="yue", transcript="", use="pending")
+    clips = api("/api/training/split", clip)
+    assert [(c["startMs"], c["endMs"]) for c in clips] == [(0, 600), (1400, 2000)]
+    project = api("/api/training", dict(name="訓練示範", clips=clips))
+    path = "/api/training/" + project["id"]
+    assert api("/api/training") == [project]
+    with wave.open(io.BytesIO(api(path + "/clip/" + project["clips"][0]["id"]))) as audio:
+        assert audio.getnframes() == 9600 and audio.getframerate() == 16000
+        assert audio.readframes(1) == b"\x00\x08"
+    api(path + "/transcribe", {"revision": project["revision"]})
+    deadline = time.monotonic() + 20
+    while api("/api/job")["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(.1)
+    job = api("/api/job")
+    if job["status"] != "done":
+        raise AssertionError((job, (root / "logs" / (job["id"] + ".log")).read_text(errors="replace")))
+    project = api("/api/training")[0]
+    assert all(clip["transcript"] == "候選逐字稿。" and clip["use"] == "pending" for clip in project["clips"])
+    project["clips"][0].update(use="train", transcript="訓練句。")
+    project["clips"][1].update(use="holdout", transcript="保留句。")
+    saved = api(path, project, method="PUT")
+    assert saved["revision"] == project["revision"] + 1
+    try:
+        api(path, project, method="PUT")
+    except urllib.error.HTTPError as err:
+        assert err.code == 409
+    else:
+        raise AssertionError("stale training project revision was accepted")
+    with ZipFile(io.BytesIO(api(path + "/dataset"))) as archive:
+        names = archive.namelist()
+        assert len(names) == 4
+        for playlist, folder, words in [
+            ("dataset.list", "wavs", "訓練句。"), ("holdout.list", "holdout", "保留句。"),
+        ]:
+            filename, speaker, language, transcript = archive.read(playlist).decode().strip().split("|")
+            assert filename.startswith(folder + "/") and filename in names
+            assert (speaker, language, transcript) == (project["id"], "YUE", words)
+    assert api("/api/training") == [saved]
+    assert not api("/api/trained-models")
+    run = root / "training" / project["id"] / "run"
+    file(run / "s1-weights/learned.ckpt", "fixture")
+    file(run / "s2-weights/learned.pth", "fixture")
+    file(run / "model.json", json.dumps({
+        "engine": "gpt-sovits", "model": "v2Pro",
+        "source_revision": "d7c2210da8c013e81a94bfc7b811a477c99fd506",
+        "gpt": "s1-weights/learned.ckpt", "sovits": "s2-weights/learned.pth",
+    }))
+    assert api("/api/trained-models") == [{"id": project["id"], "name": "訓練示範"}]
+    args = dict(engine="gpt-sovits", mode="clone", reference=synthesis_ref, text="第一句。",
+                transcript="參考。", speed=1, refLang="yue", language="yue", modelProject=project["id"])
+    key = api("/api/synthesize", args)["id"]
+    deadline = time.monotonic() + 20
+    while api("/api/job")["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(.1)
+    assert api("/api/job")["status"] == "done", api("/api/job")
+    record = api("/api/history")[0]
+    assert record["id"] == key and record["model"] == "v2Pro (fine-tuned)"
 
 
 def main():
@@ -432,11 +537,12 @@ def main():
             emotion_audio[-1] = 1
             emotion = api("/api/reference", bytes(emotion_audio))["id"]
             check_new_engines(api, root, ref, emotion)
+            check_training(api, root, ref)
         finally:
             runtime.terminate()
             runtime.wait(timeout=15)
         check_acceptance(args.binary, root, wav.getvalue())
-    print("Launcher HTTP, 15 synthesis modes, profiles, history, WAV export and CUDA acceptance checks passed.")
+    print("Launcher HTTP, 15 synthesis modes, profiles, history, training datasets, WAV export and CUDA acceptance checks passed.")
 
 
 if __name__ == "__main__":

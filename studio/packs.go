@@ -238,7 +238,7 @@ func (s *studio) selectPack(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err.Error())
 		return
 	}
-	send(w, 200, v)
+	send(w, 200, s.inspectSelected(engine, paths))
 }
 func verify(ctx context.Context, path, hash string) bool {
 	f, e := os.Open(path)

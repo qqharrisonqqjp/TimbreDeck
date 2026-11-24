@@ -53,6 +53,11 @@ def gpt(q, ref, output, _emotion_ref):
 
     gpu = torch.cuda.is_available()
     weights = dict(TTS_Config.default_configs["v2Pro"], device="cuda" if gpu else "cpu", is_half=gpu)
+    trained = q.get("trained")
+    if trained:
+        if not all(Path(trained[key]).is_file() for key in ("gpt", "sovits")):
+            raise ValueError("missing fine-tuned model file")
+        weights.update(t2s_weights_path=trained["gpt"], vits_weights_path=trained["sovits"])
     config = TTS_Config({"custom": weights})
     # Upstream saves its settings during model loading. Keep those job-local.
     config.configs_path = str(Path(output).with_name("inference.yaml"))
@@ -72,7 +77,7 @@ def gpt(q, ref, output, _emotion_ref):
     modules = {name: getattr(synth, name, None) for name in
                ("t2s_model", "vits_model", "bert_model", "cnhuhbert_model")}
     modules["speaker_embedding"] = getattr(synth.sv_model, "embedding_model", None)
-    return execution_details(torch, "v2Pro", modules, waveform_devices)
+    return execution_details(torch, "v2Pro (fine-tuned)" if trained else "v2Pro", modules, waveform_devices)
 
 
 def load_cosy_cpu(model, llm_path, flow_path, hift_path):
@@ -215,6 +220,7 @@ ADAPTERS = {
 def main():
     job = json.load(sys.stdin)
     q = job["request"]
+    q["trained"] = job.get("trained")
     root = Path.cwd()
     adapter, imports = ADAPTERS[q["engine"]]
     sys.path.insert(0, str(root))

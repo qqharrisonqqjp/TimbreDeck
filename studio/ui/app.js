@@ -36,6 +36,8 @@ let draft,
   engines,
   voices = [],
   editingVoice = null,
+  trainingProject = null,
+  trainedModels = [],
   historySelection = new Set(),
   currentJob,
   timer,
@@ -57,7 +59,7 @@ function btn(label, fn, props = {}) {
     "button",
     {
       type: "button",
-      onclick: () => Promise.resolve(fn()).catch(notice),
+      onclick: () => Promise.resolve().then(fn).catch(notice),
       ...props,
     },
     label,
@@ -105,6 +107,7 @@ function canRun(engine, mode) {
 }
 function panel() {
   const v = d().tab;
+  if (v === "training" && draft.engine === "gpt-sovits") return v;
   return ["models", "history", "voices"].includes(v)
     ? v
     : integrated(draft.engine)
@@ -164,6 +167,15 @@ function useVoice(voice) {
   draft.reference = voice.reference;
   draft.referenceName = voice.name;
 }
+function selectedTrainedModel(settings) {
+  if (settings.modelVoice === (draft.voiceId || "")) return settings.modelProject || "";
+  return selectedVoice()?.modelProject || "";
+}
+function modelOptions(base, selected) {
+  const models = { "": base, ...Object.fromEntries(trainedModels.map((model) => [model.id, model.name])) };
+  if (selected && !models[selected]) models[selected] = "找不到已選模型";
+  return models;
+}
 function referenceTranscript(settings) {
   const voice = selectedVoice();
   const belongsToReference = settings.transcriptFor === draft.reference;
@@ -207,6 +219,7 @@ function render() {
     ...(integrated(k) ? { synth: "語音合成" } : {}),
     models: "模型管理",
     voices: "聲音庫",
+    ...(k === "gpt-sovits" ? { training: "訓練素材" } : {}),
     history: "輸出歷史",
   };
   $("tabs").replaceChildren(
@@ -219,6 +232,7 @@ function render() {
   if (panel() === "synth") synthesis();
   else if (panel() === "models") models();
   else if (panel() === "voices") voiceLibrary();
+  else if (panel() === "training") training();
   else history();
   showJob();
 }
@@ -284,6 +298,20 @@ function synthesis() {
     },
   });
   const right = [box("row", field("工作模式", modeCtrl), ...(engine.speed ? [field("語速", speed)] : []))];
+  if (k === "gpt-sovits") {
+    const selected = selectedTrainedModel(settings);
+    right.push(
+      field("GPT-SoVITS 模型", select(modelOptions("v2Pro 基礎模型", selected), selected, (id) => {
+        settings.modelVoice = draft.voiceId || "";
+        update("modelProject", id);
+        render();
+      }, "trained-model")),
+      btn("重新偵測微調模型", async () => {
+        trainedModels = await api("trained-models");
+        render();
+      }),
+    );
+  }
   if (mode.reference) {
     if (voices.length)
       right.push(field("角色", select(
@@ -455,6 +483,7 @@ async function submit(preview) {
     preview,
   };
   if (mode.variant) payload.variant = mode.variant;
+  if (k === "gpt-sovits") payload.modelProject = selectedTrainedModel(s);
   if (mode.speaker) payload.speaker = s.speaker || engine.speakers[0];
   if (mode.emotion) payload.emotionStrength = s.emotionStrength ?? 1;
   if (mode.emotion === "audio") payload.emotionReference = s.emotionReference || "";
@@ -521,6 +550,10 @@ function voiceLibrary() {
     field("錄音語言", select(referenceLanguages, voice.language, (value) => { voice.language = value; }, "voice-language")),
     field("參考逐字稿", area("voice-transcript", voice.transcript, "填寫錄音中的實際對白",
       (value) => { voice.transcript = value; })),
+    field("GPT-SoVITS 模型", select(
+      modelOptions("v2Pro 基礎模型", voice.modelProject), voice.modelProject || "",
+      (id) => { voice.modelProject = id; }, "voice-trained-model",
+    )),
     box("actions",
       btn("儲存角色", async () => {
         const saved = await api(voice.id ? "profiles/" + voice.id : "profiles", voice.id ? "PUT" : "POST", voice);
@@ -548,6 +581,135 @@ function voiceLibrary() {
     render();
   }));
   $("work").replaceChildren(box("grid", list, edit));
+}
+async function training() {
+  const mark = renderID;
+  $("work").replaceChildren(hint("正在讀取訓練專案…"));
+  try {
+    const projects = await api("training");
+    if (mark !== renderID) return;
+    const projectsCard = card(
+      "訓練專案",
+      ...projects.map((project) => btn(project.name, () => {
+        trainingProject = structuredClone(project);
+        render();
+      }, { "aria-pressed": String(project.id === trainingProject?.id) })),
+      btn("新增專案", () => {
+        trainingProject = { name: "", clips: [] };
+        render();
+      }, { className: "primary" }),
+    );
+    if (!trainingProject) {
+      $("work").replaceChildren(projectsCard);
+      return;
+    }
+    const project = trainingProject;
+    const asrModel = el("input", {
+      type: "text", placeholder: "使用 GPT-SoVITS 內的 faster-whisper-large-v3",
+    });
+    const editor = card(
+      "片段與逐字稿",
+      field("專案名稱", el("input", {
+        type: "text", value: project.name, maxLength: 80,
+        oninput: (event) => { project.name = event.target.value; },
+      })),
+      field("加入 PCM16 WAV", el("input", {
+        type: "file", accept: ".wav,audio/wav", multiple: true,
+        onchange: async (event) => {
+          try {
+            for (const file of event.target.files) {
+              const ref = await api("reference", "POST", file);
+              project.clips.push({
+                reference: ref.id, sourceName: file.name, startMs: 0, endMs: Math.floor(ref.seconds * 1000),
+                language: "yue", transcript: "", use: "pending",
+              });
+            }
+          } catch (err) {
+            notice(err);
+          }
+          if (trainingProject === project && panel() === "training") training();
+        },
+      })),
+      ...project.clips.map((clip, index) => trainingClipFields(project, clip, index)),
+      box("actions",
+        btn("儲存專案", async () => {
+          const saved = await api(project.id ? "training/" + project.id : "training",
+            project.id ? "PUT" : "POST", project);
+          if (trainingProject !== project || panel() !== "training") return;
+          trainingProject = saved;
+          await training();
+          notice("訓練專案已儲存。");
+        }, { className: "primary" }),
+        ...(project.id && project.clips.some((clip) => clip.use === "train") ? [
+          el("a", { className: "linkbtn", href: "/api/training/" + project.id + "/dataset", download: "" },
+            "匯出已儲存的資料集"),
+        ] : []),
+      ),
+    );
+    if (project.id && project.clips.some((clip) => clip.use === "pending" && !clip.transcript)) {
+      editor.append(
+        field("本機轉錄模型（可選）", asrModel),
+        btn("轉錄已儲存的空白片段", async () => {
+          currentJob = await api("training/" + project.id + "/transcribe", "POST", {
+            revision: project.revision,
+            modelPath: asrModel.value.trim(),
+          });
+          showJob();
+        }),
+      );
+    }
+    $("work").replaceChildren(box("grid", projectsCard, editor));
+  } catch (err) {
+    if (mark === renderID) notice(err);
+  }
+}
+function trainingClipFields(project, clip, index) {
+  const millis = (key) => el("input", {
+    type: "number", step: 1, min: 0, value: clip[key],
+    oninput: (event) => { clip[key] = event.target.valueAsNumber; },
+  });
+  const options = { ...referenceLanguages };
+  delete options.auto;
+  return card(
+    clip.sourceName || "參考錄音",
+    box("row", field("開始毫秒", millis("startMs")), field("結束毫秒", millis("endMs"))),
+    box("row",
+      field("語言", select(options, clip.language, (value) => { clip.language = value; }, "clip-lang-" + index)),
+      field("用途", select(
+        { pending: "待校對", train: "採用作訓練", holdout: "保留作試聽", skip: "剔除" },
+        clip.use, (value) => { clip.use = value; }, "clip-use-" + index,
+      )),
+    ),
+    field("逐字稿", area("clip-text-" + index, clip.transcript, "請輸入該片段的實際對白",
+      (value) => { clip.transcript = value; })),
+    ...(project.id && clip.id ? [
+      hint("上次儲存的片段"),
+      el("audio", {
+        controls: true, preload: "none",
+        src: "/api/training/" + project.id + "/clip/" + clip.id + "?revision=" + project.revision,
+      }),
+    ] : []),
+    box("actions",
+      ...(clip.use === "pending" && !clip.transcript ? [
+        btn("按停頓自動切片", async () => {
+          const split = await api("training/split", "POST", clip);
+          if (trainingProject !== project) return;
+          const position = project.clips.indexOf(clip);
+          if (position < 0) return;
+          if (project.clips.length - 1 + split.length > 300) throw Error("每個專案最多 300 個片段。");
+          project.clips.splice(position, 1, ...split);
+          if (panel() === "training") render();
+        }),
+      ] : []),
+      btn("複製片段範圍", () => {
+        const copy = { ...clip, transcript: "", use: "pending" };
+        delete copy.id;
+        project.clips.splice(index + 1, 0, copy);
+        render();
+      }),
+      btn("移除片段", () => { project.clips.splice(index, 1); render(); }),
+    ),
+  );
 }
 function models() {
   const k = draft.engine;
@@ -687,6 +849,18 @@ async function history() {
         ),
         hint([x.voiceName, x.model || x.input.variant, x.packVersion].filter(Boolean).join(" · ") || "預覽版記錄"),
         el("p", { className: "history-text" }, x.input.text),
+        el("details", {},
+          el("summary", {}, "合成設定"),
+          hint([
+            engines[x.input.engine]?.modes?.find((mode) => mode.id === x.input.mode)?.label,
+            lang[x.input.language],
+            x.input.speaker,
+            x.input.speed && x.input.speed + " ×",
+            x.input.emotionStrength != null && "情緒強度 " + x.input.emotionStrength,
+          ].filter(Boolean).join(" · ")),
+          ...(x.input.transcript ? [hint("逐字稿　" + x.input.transcript)] : []),
+          ...(x.input.instruction ? [hint("指示　" + x.input.instruction)] : []),
+        ),
         box(
           "history-actions",
           el("audio", {
@@ -710,6 +884,18 @@ async function history() {
               historySelection.add(x.id);
             }
             history();
+          }),
+          btn("存為角色錄音", async () => {
+            const sample = await fetch("/api/audio/" + x.id);
+            if (!sample.ok) throw Error("找不到這段輸出音檔。");
+            const ref = await api("reference", "POST", await sample.blob());
+            editingVoice = {
+              name: x.voiceName || "",
+              reference: ref.id,
+              language: referenceLanguages[x.input.language] ? x.input.language : "auto",
+              transcript: x.input.text,
+            };
+            setTab("voices");
           }),
         ),
       ),
@@ -748,7 +934,7 @@ function showJob() {
   const nodes = [
     catalog[j.engine][0] +
       " · " +
-      (j.kind === "install" ? "安裝" : "語音合成") +
+      ({ install: "安裝", synthesis: "語音合成", transcription: "素材轉錄" }[j.kind] || j.kind) +
       " · " +
       states[j.status],
   ];
@@ -766,6 +952,8 @@ function showJob() {
     );
   if (j.kind === "synthesis" && j.status === "done" && d().tab !== "history")
     nodes.push(btn("試聽及匯出", () => setTab("history")));
+  if (j.kind === "transcription" && j.status === "done" && panel() === "training")
+    nodes.push("　重新選取專案以查看建議逐字稿。");
   panel.replaceChildren(...nodes);
 }
 async function poll() {
@@ -788,10 +976,11 @@ async function poll() {
 }
 (async () => {
   try {
-    const [state, profiles] = await Promise.all([api("state"), api("profiles")]);
+    const [state, profiles, models] = await Promise.all([api("state"), api("profiles"), api("trained-models")]);
     draft = state.draft;
     engines = state.engines;
     voices = profiles;
+    trainedModels = models;
     if (draft.voiceId && !selectedVoice()) delete draft.voiceId;
     draft.drafts ||= {};
     if (!catalog[draft.engine]) draft.engine = "gpt-sovits";

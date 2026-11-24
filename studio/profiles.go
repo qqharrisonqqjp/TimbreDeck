@@ -10,11 +10,12 @@ import (
 )
 
 type voiceProfile struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Reference  string `json:"reference"`
-	Transcript string `json:"transcript"`
-	Language   string `json:"language"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Reference    string `json:"reference"`
+	Transcript   string `json:"transcript"`
+	Language     string `json:"language"`
+	ModelProject string `json:"modelProject,omitempty"`
 }
 
 func (s *studio) profilePath(id string) string {
@@ -80,6 +81,12 @@ func (s *studio) saveProfile(w http.ResponseWriter, r *http.Request) {
 	if _, err := wavDuration(s.path("voices", profile.Reference+".wav")); err != nil {
 		fail(w, 422, "找不到有效的參考錄音。")
 		return
+	}
+	if profile.ModelProject != "" {
+		if _, err := s.loadTrainedModel(profile.ModelProject); err != nil {
+			fail(w, 422, "找不到選定的微調模型。")
+			return
+		}
 	}
 	s.files.Lock()
 	defer s.files.Unlock()
