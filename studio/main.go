@@ -27,18 +27,6 @@ import (
 //go:embed ui/* worker.py
 var assets embed.FS
 
-var engineIDs = []string{"gpt-sovits", "cosyvoice3", "voxcpm2", "indextts2", "qwen3-tts"}
-
-func supported(id string) bool { return id == "gpt-sovits" || id == "cosyvoice3" }
-func known(id string) bool {
-	for _, name := range engineIDs {
-		if id == name {
-			return true
-		}
-	}
-	return false
-}
-
 type studio struct {
 	root   string
 	mu     sync.Mutex
@@ -62,6 +50,7 @@ type settings struct {
 	Drafts        map[string]json.RawMessage `json:"drafts"`
 }
 type installation struct {
+	engineCapabilities
 	Path    string   `json:"path"`
 	Ready   bool     `json:"ready"`
 	Missing []string `json:"missing,omitempty"`
@@ -183,7 +172,7 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 	if !filepath.IsAbs(p) {
 		p = s.path("runtimes", engine, p)
 	}
-	v := installation{Path: p}
+	v := installation{Path: p, engineCapabilities: engineCatalog[engine]}
 	if !supported(engine) {
 		return v
 	}
@@ -226,7 +215,7 @@ func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	inst := map[string]installation{}
-	for _, k := range engineIDs {
+	for k := range engineCatalog {
 		inst[k] = s.inspect(k, paths)
 	}
 	send(w, 200, map[string]any{"draft": d, "engines": inst})

@@ -157,36 +157,39 @@ func (s *studio) validate(q *request) error {
 	q.Text = strings.TrimSpace(q.Text)
 	q.Transcript = strings.TrimSpace(q.Transcript)
 	q.Instruction = strings.TrimSpace(q.Instruction)
-	if !supported(q.Engine) || !hexID(q.Reference, 64) || q.Text == "" || len([]rune(q.Text)) > 10000 {
-		return errors.New("請選擇已接通的引擎，匯入錄音，並輸入最多 10,000 字的台詞。")
+	capabilities := engineCatalog[q.Engine]
+	mode, ok := capabilities.mode(q.Mode)
+	if !ok {
+		return errors.New("請選擇已接通的引擎及工作模式。")
+	}
+	if q.Text == "" || len([]rune(q.Text)) > 10000 {
+		return errors.New("請輸入最多 10,000 字的台詞。")
 	}
 	if q.Speed < 0.5 || q.Speed > 2 || math.IsNaN(q.Speed) {
 		return errors.New("語速範圍為 0.5 至 2 倍。")
 	}
-	secs, e := wavDuration(s.path("voices", q.Reference+".wav"))
-	if e != nil {
-		return errors.New("找不到有效的參考錄音，請重新匯入。")
-	}
-	switch q.Engine {
-	case "gpt-sovits":
-		if q.Mode != "clone" || !language(q.Language) || !language(q.RefLang) {
-			return errors.New("語言或工作模式無效。")
+	if mode.Reference {
+		if !hexID(q.Reference, 64) {
+			return errors.New("請匯入參考錄音。")
 		}
-		if secs < 3 || secs > 10 {
-			return errors.New("GPT-SoVITS 需要 3 至 10 秒的參考錄音。")
+		seconds, err := wavDuration(s.path("voices", q.Reference+".wav"))
+		if err != nil {
+			return errors.New("找不到有效的參考錄音，請重新匯入。")
 		}
-	case "cosyvoice3":
-		if secs > 30 {
-			return errors.New("CosyVoice 3 的參考錄音最長為 30 秒。")
+		if capabilities.MinReference > 0 && (seconds < capabilities.MinReference || seconds > capabilities.MaxReference) {
+			return fmt.Errorf("請匯入 %g 至 %g 秒的參考錄音。", capabilities.MinReference, capabilities.MaxReference)
 		}
-		if q.Mode != "clone" && q.Mode != "instruct" && q.Mode != "cross" {
-			return errors.New("未知的 CosyVoice 模式。")
-		}
-		if q.Mode == "instruct" && q.Instruction == "" {
-			return errors.New("請填寫講法指示。")
+		if capabilities.MaxReference > 0 && seconds > capabilities.MaxReference {
+			return fmt.Errorf("參考錄音最長為 %g 秒。", capabilities.MaxReference)
 		}
 	}
-	if q.Mode == "clone" && q.Transcript == "" {
+	if mode.Languages && (!language(q.Language) || !language(q.RefLang)) {
+		return errors.New("語言無效。")
+	}
+	if mode.Instruction && q.Instruction == "" {
+		return errors.New("請填寫講法指示。")
+	}
+	if mode.Transcript && q.Transcript == "" {
 		return errors.New("請填寫參考錄音的逐字稿。")
 	}
 	if q.Preview {

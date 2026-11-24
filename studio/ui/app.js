@@ -1,21 +1,19 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const catalog = {
-  "gpt-sovits": ["GPT-SoVITS", "以參考錄音及逐字稿複製聲線。", "v2Pro"],
+  "gpt-sovits": ["GPT-SoVITS", "以參考錄音及逐字稿複製聲線。"],
   cosyvoice3: [
     "CosyVoice 3",
     "以同一段錄音進行聲音複製、跨語言朗讀或指令朗讀。",
-    "Fun-CosyVoice3-0.5B",
   ],
-  voxcpm2: ["VoxCPM2", "規劃支援錄音複製及文字聲線設計。", "VoxCPM2"],
-  indextts2: ["IndexTTS-2", "規劃支援獨立的角色音色與情緒示範。", "IndexTTS-2"],
+  voxcpm2: ["VoxCPM2", "規劃支援錄音複製及文字聲線設計。"],
+  indextts2: ["IndexTTS-2", "規劃支援獨立的角色音色與情緒示範。"],
   "qwen3-tts": [
     "Qwen3-TTS",
     "規劃支援錄音複製、預設聲線及文字聲線設計。",
-    "Base · CustomVoice · VoiceDesign",
   ],
 };
-const integrated = (k) => ["gpt-sovits", "cosyvoice3"].includes(k);
+const integrated = (k) => Boolean(engines[k]?.modes?.length);
 const lang = {
   yue: "粵語（可夾英語）",
   zh: "普通話",
@@ -83,6 +81,9 @@ async function api(path, method = "GET", data) {
 }
 function d() {
   return (draft.drafts[draft.engine] ||= {});
+}
+function selectedMode(engine, id) {
+  return engine.modes.find((mode) => mode.id === id) ?? engine.modes[0];
 }
 function panel() {
   const v = d().tab;
@@ -177,8 +178,8 @@ function render() {
 function synthesis() {
   const k = draft.engine,
     settings = d(),
-    gpt = k === "gpt-sovits";
-  const mode = gpt ? "clone" : settings.mode || "clone";
+    engine = engines[k];
+  const mode = selectedMode(engine, settings.mode);
   function update(key, v) {
     settings[key] = v;
     changed();
@@ -193,12 +194,12 @@ function synthesis() {
     },
   );
   script.maxLength = 10000;
-  const modes = gpt
-    ? { clone: "錄音複製" }
-    : { clone: "錄音複製", instruct: "指令朗讀", cross: "跨語言朗讀" };
+  const modes = Object.fromEntries(
+    engine.modes.map(({ id, label }) => [id, label]),
+  );
   const modeCtrl = select(
     modes,
-    mode,
+    mode.id,
     (v) => {
       update("mode", v);
       render();
@@ -238,21 +239,24 @@ function synthesis() {
   });
   const right = [
     box("row", field("工作模式", modeCtrl), field("語速", speed)),
-    field("參考錄音（WAV）", el("span", { className: "filebtn" }, ref)),
   ];
-  right.push(
-    hint(gpt ? "使用 3 至 10 秒的單人錄音。" : "使用最多 30 秒的清晰單人錄音。"),
-  );
-  if (draft.reference)
-    right.push(
-      el("p", { className: "file-name" }, draft.referenceName || "已匯入錄音"),
-      el("audio", {
-        controls: true,
-        preload: "metadata",
-        src: "/api/reference/" + draft.reference,
-      }),
-    );
-  if (mode === "clone")
+  if (mode.reference) {
+    right.push(field("參考錄音（WAV）", el("span", { className: "filebtn" }, ref)));
+    if (engine.minReference)
+      right.push(hint(`使用 ${engine.minReference} 至 ${engine.maxReference} 秒的單人錄音。`));
+    else if (engine.maxReference)
+      right.push(hint(`使用最多 ${engine.maxReference} 秒的清晰單人錄音。`));
+    if (draft.reference)
+      right.push(
+        el("p", { className: "file-name" }, draft.referenceName || "已匯入錄音"),
+        el("audio", {
+          controls: true,
+          preload: "metadata",
+          src: "/api/reference/" + draft.reference,
+        }),
+      );
+  }
+  if (mode.transcript)
     right.push(
       field(
         "參考錄音原本說了甚麼？",
@@ -264,7 +268,7 @@ function synthesis() {
         ),
       ),
     );
-  if (mode === "instruct")
+  if (mode.instruction)
     right.push(
       field(
         "講法指示",
@@ -276,7 +280,7 @@ function synthesis() {
         ),
       ),
     );
-  if (gpt)
+  if (mode.languages)
     right.push(
       box(
         "row",
@@ -314,14 +318,14 @@ function synthesis() {
         btn("前往模型管理", () => setTab("models")),
       ),
     );
-  $("work").replaceChildren(box("grid", left, card(catalog[k][2], ...right)));
+  $("work").replaceChildren(box("grid", left, card(engine.variants.join(" · "), ...right)));
 }
 async function submit(preview) {
   const k = draft.engine,
     s = d();
   const payload = {
     engine: k,
-    mode: k === "gpt-sovits" ? "clone" : s.mode || "clone",
+    mode: selectedMode(engines[k], s.mode).id,
     text: draft.text || "",
     transcript: s.transcript || "",
     instruction: s.instruction || "",
@@ -338,7 +342,7 @@ async function submit(preview) {
 function models() {
   const k = draft.engine;
   const root = engines[k].path;
-  const about = card("模型", el("h3", {}, catalog[k][2]));
+  const about = card("模型", el("h3", {}, engines[k].variants.join(" · ")));
   if (!integrated(k)) {
     about.append(hint("本預覽版尚未接通這款引擎。"));
     $("work").replaceChildren(about);

@@ -195,6 +195,17 @@ def main():
             state = api("/api/state")
             assert len(state["engines"]) == 5
             assert all(state["engines"][k]["ready"] for k in MANDATORY)
+            gpt_modes = state["engines"]["gpt-sovits"]["modes"]
+            assert [(m["id"], m["reference"], m["transcript"], m["languages"])
+                    for m in gpt_modes] == [("clone", True, True, True)]
+            cosy_modes = state["engines"]["cosyvoice3"]["modes"]
+            assert [(m["id"], m["reference"], m["transcript"], m["instruction"])
+                    for m in cosy_modes] == [
+                ("clone", True, True, False), ("instruct", True, False, True),
+                ("cross", True, False, False),
+            ]
+            assert not state["engines"]["qwen3-tts"].get("modes")
+            assert state["engines"]["qwen3-tts"]["variants"] == ["Base", "CustomVoice", "VoiceDesign"]
             wav = io.BytesIO()
             with wave.open(wav, "wb") as out:
                 out.setparams((1, 2, 16000, 0, "NONE", "NONE"))
@@ -205,6 +216,14 @@ def main():
                                  ("cosyvoice3", "instruct"), ("cosyvoice3", "cross")]:
                 request = dict(engine=engine, mode=mode, reference=ref, preview=True, text="第一句。第二句。",
                                transcript="參考。", instruction="請用廣東話。", speed=1.25, refLang="yue", language="yue")
+                required = "transcript" if mode == "clone" else "instruction" if mode == "instruct" else None
+                if required:
+                    try:
+                        api("/api/synthesize", dict(request, **{required: ""}))
+                    except urllib.error.HTTPError as err:
+                        assert err.code == 422
+                    else:
+                        raise AssertionError(f"{engine}/{mode} accepted missing {required}")
                 key = api("/api/synthesize", request)["id"]
                 until = time.monotonic() + 20
                 while time.monotonic() < until:
