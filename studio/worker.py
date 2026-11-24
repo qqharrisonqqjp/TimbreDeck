@@ -1,5 +1,6 @@
 """One synthesis per process, using the engine's own portable Python."""
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -45,14 +46,23 @@ def gpt(q, ref, output, _emotion_ref):
 
     # The pinned GPT source sets this detector during import. Its large model
     # normally downloads on first use. Select the bundled compact model offline.
-    if not Path("GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin").is_file():
+    base = Path(q["modelRoot"]) / "GPT_SoVITS/pretrained_models"
+    detector_model = base / "fast_langdetect/lid.176.bin"
+    if q["modelRoot"] or not detector_model.is_file():
         import fast_langdetect
         small = Path(fast_langdetect.__file__).parent / "resources" / "lid.176.ftz"
-        detector = fast_langdetect.LangDetectConfig(custom_model_path=str(small))
+        detector = fast_langdetect.LangDetectConfig(custom_model_path=str(detector_model if detector_model.is_file() else small))
         fast_langdetect.infer._default_detector = fast_langdetect.LangDetector(detector)
 
     gpu = torch.cuda.is_available()
     weights = dict(TTS_Config.default_configs["v2Pro"], device="cuda" if gpu else "cpu", is_half=gpu)
+    if q["modelRoot"]:
+        import sv
+        sv.sv_path = str(base / "sv/pretrained_eres2netv2w24s4ep4.ckpt")
+        weights.update(t2s_weights_path=str(base / "s1v3.ckpt"),
+                       vits_weights_path=str(base / "v2Pro/s2Gv2Pro.pth"),
+                       cnhuhbert_base_path=str(base / "chinese-hubert-base"),
+                       bert_base_path=str(base / "chinese-roberta-wwm-ext-large"))
     trained = q.get("trained")
     if trained:
         if not all(Path(trained[key]).is_file() for key in ("gpt", "sovits")):
@@ -97,7 +107,7 @@ def cosy(q, ref, output, _emotion_ref):
     from cosyvoice.cli.cosyvoice import CosyVoice3
 
     import torch
-    model_dir = "pretrained_models/Fun-CosyVoice3-0.5B"
+    model_dir = str(Path(q["modelRoot"]) / "pretrained_models/Fun-CosyVoice3-0.5B")
     if torch.cuda.is_available():
         model = CosyVoice3(model_dir=model_dir)
     else:
@@ -136,7 +146,8 @@ def vox(q, ref, output, _emotion_ref):
     from voxcpm import VoxCPM
 
     model = VoxCPM.from_pretrained(
-        "pretrained_models/VoxCPM2", load_denoiser=False, local_files_only=True, optimize=False,
+        str(Path(q["modelRoot"]) / "pretrained_models/VoxCPM2"),
+        load_denoiser=False, local_files_only=True, optimize=False,
     )
     waveform_devices = set()
     observe_output(model.tts_model.audio_vae, "decode", waveform_devices)
@@ -154,9 +165,22 @@ def vox(q, ref, output, _emotion_ref):
 def index(q, ref, output, emotion_ref):
     import soundfile as sf
     import torch
+    paths = {}
+    if q["modelRoot"]:
+        checkpoint_dir = Path(q["modelRoot"]) / "checkpoints"
+        cache = str(checkpoint_dir / "hf_cache")
+        os.environ["HF_HUB_CACHE"] = cache
+        os.environ["TRANSFORMERS_CACHE"] = cache
+        # The pinned adapter sets HF_HUB_CACHE at import time. Initialize the
+        # shared cache constants first, then restore the job's cache environment.
+        import huggingface_hub.constants
+        import transformers.utils.hub
+        paths = dict(cfg_path=str(checkpoint_dir / "config.yaml"), model_dir=str(checkpoint_dir))
     from indextts.infer_v2 import IndexTTS2
+    if paths:
+        os.environ["HF_HUB_CACHE"] = cache
 
-    model = IndexTTS2(use_cuda_kernel=False, use_deepspeed=False)
+    model = IndexTTS2(use_cuda_kernel=False, use_deepspeed=False, **paths)
     waveform_devices = set()
     observe_output(model.bigvgan, "forward", waveform_devices)
     options = {}
@@ -190,7 +214,7 @@ def qwen(q, ref, output, _emotion_ref):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device != "cpu" and torch.cuda.is_bf16_supported() else torch.float32
     model = Qwen3TTSModel.from_pretrained(
-        str(Path("pretrained_models") / name), device_map=device, dtype=dtype,
+        str(Path(q["modelRoot"]) / "pretrained_models" / name), device_map=device, dtype=dtype,
         attn_implementation="sdpa", local_files_only=True,
     )
     options = dict(text=q["text"], language=QWEN_LANGUAGES[q["language"]])
@@ -221,6 +245,7 @@ def main():
     job = json.load(sys.stdin)
     q = job["request"]
     q["trained"] = job.get("trained")
+    q["modelRoot"] = job.get("modelRoot", "")
     root = Path.cwd()
     adapter, imports = ADAPTERS[q["engine"]]
     sys.path.insert(0, str(root))

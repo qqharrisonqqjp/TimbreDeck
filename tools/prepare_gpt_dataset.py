@@ -55,14 +55,14 @@ def check_rows(path, expected, header=None):
     return rows
 
 
-def prepare(engine, dataset, output, gpu):
+def prepare(engine, dataset, output, gpu, model_root=None):
     if output.exists():
         raise FileExistsError(output)
     paths = read_dataset(dataset)
     list_path = dataset / "dataset.list"
     list_hash = sha256_file(list_path)
     gpt = engine / "GPT_SoVITS"
-    weights = gpt / "pretrained_models"
+    weights = (model_root or engine) / "GPT_SoVITS/pretrained_models"
     python = engine / "runtime" / "python.exe"
     config = gpt / "configs" / "s2v2Pro.json"
     scripts = [gpt / "prepare_datasets" / name for name in STAGES]
@@ -111,11 +111,13 @@ def main():
     parser.add_argument("dataset", type=Path, help="extracted TimbreDeck export")
     parser.add_argument("output", type=Path, help="new feature output directory")
     parser.add_argument("--gpu", help="one CUDA device index")
+    parser.add_argument("--models", type=Path, help="separately installed v2Pro model pack root")
     args = parser.parse_args()
     if args.gpu is not None and not re.fullmatch(r"[0-9]+", args.gpu):
         parser.error("specify one nonnegative CUDA device index")
     try:
-        prepare(args.engine.resolve(), args.dataset.resolve(), args.output.resolve(), args.gpu)
+        prepare(args.engine.resolve(), args.dataset.resolve(), args.output.resolve(), args.gpu,
+                args.models.resolve() if args.models else None)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"{exc}\n")
 

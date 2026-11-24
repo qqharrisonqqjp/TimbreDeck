@@ -108,7 +108,7 @@ function canRun(engine, mode) {
 function panel() {
   const v = d().tab;
   if (v === "training" && draft.engine === "gpt-sovits") return v;
-  return ["models", "history", "voices"].includes(v)
+  return ["models", "history", "voices", "storage"].includes(v)
     ? v
     : integrated(draft.engine)
       ? "synth"
@@ -205,7 +205,7 @@ function render() {
     ? "待接通"
     : engines[k].ready
       ? "已找到引擎檔案"
-      : "未安裝引擎";
+      : engines[k].engineInstalled ? "未安裝模型" : "未安裝引擎";
   $("notice").textContent = "";
   $("switcher").replaceChildren(
     ...Object.keys(catalog).map((id) =>
@@ -221,6 +221,7 @@ function render() {
     voices: "聲音庫",
     ...(k === "gpt-sovits" ? { training: "訓練素材" } : {}),
     history: "輸出歷史",
+    storage: "設定",
   };
   $("tabs").replaceChildren(
     ...Object.entries(tabs).map(([id, label]) =>
@@ -233,6 +234,7 @@ function render() {
   else if (panel() === "models") models();
   else if (panel() === "voices") voiceLibrary();
   else if (panel() === "training") training();
+  else if (panel() === "storage") storageSettings();
   else history();
   showJob();
 }
@@ -711,124 +713,197 @@ function trainingClipFields(project, clip, index) {
     ),
   );
 }
+function downloadControl(engine, kind, label, variant = "") {
+  const suffix = new URLSearchParams({ kind, variant }).toString();
+  const route = engine + "?" + suffix;
+  const info = el("div", { className: "stack", role: "status" });
+  const gb = (bytes) => (bytes / 1e9).toFixed(2) + " GB";
+  const lookup = async () => {
+    info.textContent = "正在查詢下載版本…";
+    try {
+      const p = await api("pack/" + route);
+      info.replaceChildren(
+        hint(p.version + "　下載 " + gb(p.bytes) + "　安裝後 " + gb(p.expanded)
+          + "　可用空間 " + gb(p.free)),
+        btn("確認下載並安裝", async () => {
+          currentJob = await api("install/" + route, "POST", { hash: p.hash });
+          showJob();
+        }, { className: "primary" }),
+      );
+    } catch (err) {
+      info.textContent = err.message;
+    }
+  };
+  return box("stack", box("actions", btn(label, lookup)), info);
+}
+
+async function refreshAssets(message) {
+  const [state, models] = await Promise.all([api("state"), api("trained-models")]);
+  engines = state.engines;
+  trainedModels = models;
+  render();
+  notice(message);
+}
+
 function models() {
   const k = draft.engine;
-  const root = engines[k].path;
-  const about = card("模型", el("h3", {}, engines[k].variants.join(" · ")));
-  if (engines[k].availableVariants?.length)
-    about.append(hint("已找到模型：" + engines[k].availableVariants.join("、")));
-  if (!integrated(k)) {
-    about.append(hint("本預覽版尚未接通這款引擎。"));
-    $("work").replaceChildren(about);
-    return;
-  }
+  const engine = engines[k];
+  const root = engine.path;
   const path = el("input", { type: "text", id: "path", placeholder: root });
-  const info = el("div", { className: "stack" });
-  async function lookup() {
-    info.textContent = "正在查詢版本…";
-    try {
-      const p = await api("pack/" + k);
-      const gb = (n) => (n / 1e9).toFixed(2) + " GB";
-      info.replaceChildren(
-        hint(
-          p.version +
-            "　下載 " +
-            gb(p.bytes) +
-            "　安裝後 " +
-            gb(p.expanded) +
-            "　可用空間 " +
-            gb(p.free),
-        ),
-        btn(
-          "下載並安裝",
-          async () => {
-            currentJob = await api("install/" + k, "POST", { hash: p.hash });
-            showJob();
-          },
-          { className: "primary" },
-        ),
-      );
-    } catch (e) {
-      info.textContent = e.message;
-    }
-  }
-  about.append(
-    hint("從本專案的 GitHub 發佈頁查詢引擎包。"),
-    box("actions", btn("檢查可下載版本", lookup)),
-    info,
-  );
-  const manifest = el("input", {
-    type: "text",
-    id: "manifest",
-    placeholder: "D:\\Packs\\gpt-sovits.json",
-  });
   const versions = el("div", { className: "stack" });
+  const runtime = card(
+    "引擎",
+    hint(engine.engineInstalled ? "已找到引擎程式" : "未安裝引擎程式"),
+    downloadControl(k, "runtime", "下載引擎"),
+    versions,
+  );
   api("installed-packs/" + k)
     .then((packs) => {
       if (!packs.length) return;
       versions.replaceChildren(
-        el("h3", {}, "已安裝版本"),
+        el("h3", {}, "已安裝引擎版本"),
         ...packs.map((pack) => {
           const label = pack.version || pack.id;
-          if (pack.active) return hint(label + " · 使用中");
-          return btn("切換至 " + label, async () => {
-            engines[k] = await api("installed-packs/" + k, "POST", { id: pack.id });
-            render();
-            notice("已切換引擎包。");
-          });
+          return box("stack",
+            hint(label + (pack.intact ? (pack.active ? " · 使用中" : "") : " · 缺少引擎檔案")),
+            box("actions",
+              ...(!pack.active && pack.intact ? [btn("選用引擎版本", async () => {
+                await api("installed-packs/" + k, "POST", { id: pack.id });
+                await refreshAssets("已切換引擎版本。");
+              })] : []),
+              ...(pack.managed ? [btn("刪除引擎", async () => {
+                if (!window.confirm("刪除引擎 " + label + "？模型、錄音及紀錄會保留。")) return;
+                await api("installed-packs/" + k + "/" + pack.id, "DELETE");
+                await refreshAssets("已刪除引擎，錄音、模型及紀錄已保留。");
+              })] : []),
+            ),
+          );
         }),
       );
     })
-    .catch((e) => { versions.textContent = e.message; });
+    .catch((err) => { versions.textContent = err.message; });
+
+  const official = card("官方模型");
+  const installed = api("installed-models/" + k);
+  for (const variant of engine.variants) {
+    const files = el("div", { className: "stack" });
+    official.append(box("stack",
+      el("h3", {}, variant),
+      hint(engine.availableVariants?.includes(variant) ? "已找到模型檔案" : "未安裝此模型"),
+      downloadControl(k, "model", "下載模型", variant),
+      files,
+    ));
+    installed.then((items) => {
+        files.replaceChildren(...items.filter((item) => item.variant === variant).map((item) =>
+          box("stack",
+            hint((item.version || item.id) + (item.source === "bundle" ? " · 原整合包" : "")),
+            box("actions", btn("刪除模型", async () => {
+              if (!window.confirm("刪除 " + variant + " 模型權重？錄音及生成紀錄會保留。")) return;
+              await api("installed-models/" + k + "/" + encodeURIComponent(variant) + "/" + item.id
+                + "?source=" + item.source, "DELETE");
+              await refreshAssets("已刪除模型權重，錄音及紀錄已保留。");
+            })),
+            el("details", {}, el("summary", {}, "模型檔案位置"), el("p", { className: "path" }, item.path)),
+          ),
+        ));
+      })
+      .catch((err) => { files.textContent = err.message; });
+  }
+
+  const manifest = el("input", {
+    type: "text", id: "manifest", placeholder: "D:\\Packs\\" + k + "-runtime.json",
+  });
   const localPack = card(
-    "匯入本機引擎包",
-    hint("把 JSON 清單和所有分卷放在同一資料夾。"),
+    "離線匯入",
+    hint("支援獨立引擎包、模型包及舊整合包。把清單及分卷放在同一資料夾。"),
     field("JSON 清單完整路徑", manifest),
     btn("校驗並安裝", async () => {
       if (!manifest.value.trim()) throw Error("請輸入 JSON 清單完整路徑。");
       currentJob = await api("import-pack/" + k, "POST", { path: manifest.value.trim() });
       showJob();
     }),
-    versions,
+    el("details", {}, el("summary", {}, "下載舊整合包"), downloadControl(k, "", "下載整合包")),
   );
   const folder = card(
     "連接現有引擎",
-    hint(
-      "輸入含有 runtime 與引擎程式的完整資料夾路徑。放在預設位置的引擎可直接重新偵測。",
-    ),
-    hint("目前檢查的位置"),
     el("p", { className: "path" }, root),
     field("引擎資料夾", path),
-    box(
-      "actions",
+    box("actions",
       btn("驗證並連接", async () => {
         if (!path.value.trim()) throw Error("請輸入引擎資料夾路徑。");
-        engines[k] = await api("engine", "POST", {
-          engine: k,
-          path: path.value.trim(),
-        });
-        render();
-        notice("已找到必要檔案，可前往語音合成。");
+        await api("engine", "POST", { engine: k, path: path.value.trim() });
+        await refreshAssets("已連接引擎。");
       }),
-      btn("重新偵測", async () => {
-        engines = (await api("state")).engines;
-        render();
-        notice(
-          engines[k].ready
-            ? "已找到必要檔案。"
-            : "缺少：" + (engines[k].missing || []).join("、"),
-        );
-      }),
+      btn("重新偵測", () => refreshAssets("已重新偵測引擎及模型。")),
+      ...(engine.external ? [btn("解除連接", async () => {
+        await api("engine", "POST", { engine: k, path: "" });
+        await refreshAssets("已解除連接，原本資料夾仍可使用。");
+      })] : []),
     ),
   );
-  if (engines[k].ready)
-    folder.append(
-      box(
-        "actions",
-        btn("前往語音合成", () => setTab("synth"), { className: "primary" }),
-      ),
+  const trained = [];
+  if (k === "gpt-sovits") {
+    trained.push(card(
+      "微調模型",
+      btn("訓練角色模型", () => setTab("training")),
+      ...(trainedModels.length ? trainedModels.map((model) => box("stack", hint(model.name),
+        box("actions", btn("刪除微調模型", async () => {
+          if (!window.confirm("刪除「" + model.name + "」的生成權重與訓練檢查點？專案、素材及紀錄會保留。")) return;
+          await api("trained-models/" + model.id, "DELETE");
+          await refreshAssets("已刪除微調權重，專案及素材已保留。");
+        })),
+      )) : [hint("完成微調後，模型會在這裏出現。")]),
+      btn("重新偵測微調模型", () => refreshAssets("已重新偵測微調模型。")),
+    ));
+  }
+  $("work").replaceChildren(box("grid", box("stack", runtime, folder, localPack),
+    box("stack", official, ...trained)));
+}
+
+async function storageSettings() {
+  const mark = renderID;
+  $("work").replaceChildren(hint("正在讀取錄音…"));
+  try {
+    const [unused, outputs] = await Promise.all([api("unused-recordings"), api("history")]);
+    if (mark !== renderID) return;
+    const refresh = async (message) => {
+      if (panel() === "storage") {
+        await storageSettings();
+        notice(message);
+      }
+    };
+    const reference = card(
+      "未使用的參考錄音",
+      hint("草稿、角色、訓練及歷史用到的參考錄音會保留。"),
+      ...(unused.length ? unused.map((item) => box("stack",
+        el("audio", { controls: true, preload: "none", src: "/api/reference/" + item.id }),
+        box("actions", hint((item.bytes / 1e6).toFixed(2) + " MB"),
+          btn("刪除參考錄音", async () => {
+            if (!window.confirm("永久刪除這段未使用的參考錄音？")) return;
+            await api("unused-recordings/" + item.id, "DELETE");
+            await refresh("已刪除參考錄音。");
+          })),
+      )) : [hint("沒有可清理的參考錄音。")]),
     );
-  $("work").replaceChildren(box("grid", folder, box("stack", about, localPack)));
+    const files = outputs.filter((output) => output.audioAvailable);
+    const generated = card(
+      "已生成的錄音",
+      hint("刪除 WAV 後，歷史仍保留台詞、模型和合成設定。"),
+      ...(files.length ? files.map((item) => box("stack",
+        hint(item.input.text),
+        el("audio", { controls: true, preload: "none", src: "/api/audio/" + item.id }),
+        box("actions", btn("刪除生成 WAV", async () => {
+          if (!window.confirm("永久刪除這段 WAV？合成紀錄會保留。")) return;
+          await api("audio/" + item.id, "DELETE");
+          historySelection.delete(item.id);
+          await refresh("已刪除 WAV，合成紀錄已保留。");
+        })),
+      )) : [hint("沒有已生成的錄音。")]),
+    );
+    $("work").replaceChildren(box("grid", reference, generated));
+  } catch (err) {
+    if (mark === renderID) $("work").replaceChildren(hint(err.message));
+  }
 }
 async function history() {
   const mark = renderID;
@@ -861,7 +936,7 @@ async function history() {
           ...(x.input.transcript ? [hint("逐字稿　" + x.input.transcript)] : []),
           ...(x.input.instruction ? [hint("指示　" + x.input.instruction)] : []),
         ),
-        box(
+        x.audioAvailable ? box(
           "history-actions",
           el("audio", {
             controls: true,
@@ -897,7 +972,7 @@ async function history() {
             };
             setTab("voices");
           }),
-        ),
+        ) : hint("錄音已刪除"),
       ),
     );
     $("work").replaceChildren(

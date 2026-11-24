@@ -416,6 +416,12 @@ func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy() {
+		fail(w, 409, "已有作業進行中。")
+		return
+	}
 	project, err := s.loadTraining(r.PathValue("id"))
 	if err != nil || project.Revision != in.Revision {
 		fail(w, 409, "請先儲存或重新載入訓練專案。")
@@ -430,7 +436,8 @@ func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err.Error())
 		return
 	}
-	engine := s.inspect("gpt-sovits", paths).Path
+	installation := s.inspectSelected("gpt-sovits", paths)
+	engine := installation.Path
 	if !installedFile(filepath.Join(engine, "runtime", "python.exe")) {
 		fail(w, 422, "請先連接有 faster-whisper 的 GPT-SoVITS 執行環境。")
 		return
@@ -438,16 +445,18 @@ func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimSpace(in.ModelPath)
 	if model == "" {
 		model = filepath.Join(engine, "GPT_SoVITS", "pretrained_models", "faster-whisper-large-v3")
+		if candidate := installation.modelPaths["v2Pro"]; candidate != "" {
+			split := filepath.Join(candidate, "GPT_SoVITS", "pretrained_models", "faster-whisper-large-v3")
+			if installedFile(filepath.Join(split, "model.bin")) {
+				model = split
+			}
+		}
 	}
 	if !filepath.IsAbs(model) || len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
 		fail(w, 422, "請輸入完整的本機 faster-whisper 模型資料夾路徑。")
 		return
 	}
-	ctx, j, ok := s.reserve("gpt-sovits", "transcription")
-	if !ok {
-		fail(w, 409, "已有作業進行中。")
-		return
-	}
+	ctx, j, _ := s.reserveLocked("gpt-sovits", "transcription")
 	go func() { s.finish(s.transcribe(ctx, j.ID, engine, model, project)) }()
 	send(w, 202, j)
 }

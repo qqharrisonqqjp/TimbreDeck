@@ -54,9 +54,12 @@ type installation struct {
 	engineCapabilities
 	Path              string   `json:"path"`
 	Ready             bool     `json:"ready"`
+	EngineInstalled   bool     `json:"engineInstalled"`
+	External          bool     `json:"external"`
 	Missing           []string `json:"missing,omitempty"`
 	AvailableVariants []string `json:"availableVariants,omitempty"`
 	variantPaths      map[string]string
+	modelPaths        map[string]string
 }
 
 func id() string {
@@ -255,75 +258,6 @@ func installedFile(path string) bool {
 	data, err := os.ReadFile(path)
 	return err == nil && !strings.HasPrefix(string(data), "version https://git-lfs.github.com/spec/v1")
 }
-func (s *studio) inspect(engine string, paths map[string]string) installation {
-	p := paths[engine]
-	if !filepath.IsAbs(p) {
-		p = s.path("runtimes", engine, p)
-	}
-	v := installation{Path: p, engineCapabilities: engineCatalog[engine]}
-	if !supported(engine) {
-		return v
-	}
-	v.Missing = missingFiles(p, required(engine))
-	if engine == "indextts2" {
-		v.Missing = append(v.Missing, missingIndexCaches(p)...)
-	}
-	if engine == "qwen3-tts" {
-		for _, variant := range v.Variants {
-			model := filepath.Join(p, "pretrained_models", "Qwen3-TTS-12Hz-1.7B-"+variant)
-			files := []string{
-				"config.json", "generation_config.json", "tokenizer_config.json", "speech_tokenizer/config.json",
-				"speech_tokenizer/model.safetensors",
-			}
-			if len(missingFiles(model, files)) == 0 && modelWeightsAvailable(model) {
-				v.AvailableVariants = append(v.AvailableVariants, variant)
-			}
-		}
-		if len(v.AvailableVariants) == 0 {
-			v.Missing = append(v.Missing, "pretrained_models/Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice,VoiceDesign}")
-		}
-	}
-	v.Ready = len(v.Missing) == 0
-	return v
-}
-
-func (s *studio) inspectSelected(engine string, paths map[string]string) installation {
-	v := s.inspect(engine, paths)
-	if engine != "qwen3-tts" {
-		return v
-	}
-	v.variantPaths = map[string]string{}
-	add := func(candidate installation) {
-		if candidate.Ready {
-			for _, variant := range candidate.AvailableVariants {
-				if v.variantPaths[variant] == "" {
-					v.variantPaths[variant] = candidate.Path
-				}
-			}
-		}
-	}
-	add(v)
-	entries, _ := os.ReadDir(s.path("runtimes", engine))
-	for _, entry := range entries {
-		if len(v.variantPaths) == len(v.Variants) {
-			break
-		}
-		if entry.IsDir() && installedPackName.MatchString(entry.Name()) {
-			add(s.inspect(engine, map[string]string{engine: entry.Name()}))
-		}
-	}
-	v.AvailableVariants = nil
-	for _, variant := range v.Variants {
-		if v.variantPaths[variant] != "" {
-			v.AvailableVariants = append(v.AvailableVariants, variant)
-		}
-	}
-	if len(v.AvailableVariants) > 0 {
-		v.Ready, v.Missing = true, nil
-	}
-	return v
-}
-
 func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 	s.files.Lock()
 	defer s.files.Unlock()
@@ -383,7 +317,7 @@ func (s *studio) setPath(w http.ResponseWriter, r *http.Request) {
 		paths[in.Engine] = filepath.Clean(in.Path)
 	}
 	v := s.inspect(in.Engine, paths)
-	if !v.Ready && in.Path != "" {
+	if !v.EngineInstalled && in.Path != "" {
 		fail(w, 422, "未找到必要檔案："+strings.Join(v.Missing, "、"))
 		return
 	}
@@ -396,7 +330,13 @@ func (s *studio) setPath(w http.ResponseWriter, r *http.Request) {
 func (s *studio) reserve(engine, kind string) (context.Context, job, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active != nil && (s.active.Status == "running" || s.active.Status == "cancelling") {
+	return s.reserveLocked(engine, kind)
+}
+func (s *studio) busy() bool {
+	return s.active != nil && (s.active.Status == "running" || s.active.Status == "cancelling")
+}
+func (s *studio) reserveLocked(engine, kind string) (context.Context, job, bool) {
+	if s.busy() {
 		return nil, job{}, false
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -441,8 +381,12 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("GET /api/training/{id}/dataset", s.trainingDataset)
 	m.HandleFunc("POST /api/training/{id}/transcribe", s.trainingTranscribe)
 	m.HandleFunc("GET /api/trained-models", s.trainedModels)
+	m.HandleFunc("DELETE /api/trained-models/{id}", s.removeTrainedModel)
 	m.HandleFunc("POST /api/synthesize", s.synthesize)
 	m.HandleFunc("GET /api/history", s.history)
+	m.HandleFunc("DELETE /api/audio/{id}", s.removeOutputAudio)
+	m.HandleFunc("GET /api/unused-recordings", s.listUnusedRecordings)
+	m.HandleFunc("DELETE /api/unused-recordings/{id}", s.removeUnusedRecording)
 	m.HandleFunc("GET /api/audio/{id}", s.audio)
 	m.HandleFunc("GET /api/reference/{id}", s.referenceAudio)
 	m.HandleFunc("GET /api/job", func(w http.ResponseWriter, r *http.Request) { s.mu.Lock(); defer s.mu.Unlock(); send(w, 200, s.active) })
@@ -462,6 +406,9 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("POST /api/import-pack/{engine}", s.importPack)
 	m.HandleFunc("GET /api/installed-packs/{engine}", s.installedPacks)
 	m.HandleFunc("POST /api/installed-packs/{engine}", s.selectPack)
+	m.HandleFunc("DELETE /api/installed-packs/{engine}/{id}", s.removeRuntime)
+	m.HandleFunc("GET /api/installed-models/{engine}", s.installedModels)
+	m.HandleFunc("DELETE /api/installed-models/{engine}/{variant}/{id}", s.removeOfficialModel)
 	ui, _ := fs.Sub(assets, "ui")
 	m.Handle("GET /", http.FileServer(http.FS(ui)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

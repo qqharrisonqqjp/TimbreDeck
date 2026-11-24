@@ -167,14 +167,16 @@ type request struct {
 	Preview          bool      `json:"preview"`
 }
 type recording struct {
-	ID          string    `json:"id"`
-	Created     time.Time `json:"created"`
-	Seconds     float64   `json:"seconds"`
-	Input       request   `json:"input"`
-	VoiceName   string    `json:"voiceName,omitempty"`
-	SampleRate  uint32    `json:"sampleRate,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	PackVersion string    `json:"packVersion,omitempty"`
+	ID             string    `json:"id"`
+	Created        time.Time `json:"created"`
+	Seconds        float64   `json:"seconds"`
+	Input          request   `json:"input"`
+	VoiceName      string    `json:"voiceName,omitempty"`
+	SampleRate     uint32    `json:"sampleRate,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	PackVersion    string    `json:"packVersion,omitempty"`
+	RuntimeVersion string    `json:"runtimeVersion,omitempty"`
+	AudioAvailable bool      `json:"audioAvailable"`
 }
 
 func firstSentence(s string) string {
@@ -287,6 +289,12 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy() {
+		fail(w, 409, "已有作業進行中。")
+		return
+	}
 	var voice string
 	mode, _ := engineCatalog[q.Engine].mode(q.Mode)
 	if mode.Reference {
@@ -326,29 +334,26 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, "請先在模型管理連接完整引擎。")
 		return
 	}
-	root := v.Path
-	if q.Engine == "qwen3-tts" {
-		root = v.variantPaths[q.Variant]
-		if root == "" {
-			fail(w, 409, "請先在模型管理連接 "+q.Variant+" 模型。")
-			return
-		}
-	}
-	ctx, j, ok := s.reserve(q.Engine, "synthesis")
-	if !ok {
-		fail(w, 409, "已有作業進行中。")
+	root := v.variantPaths[q.Variant]
+	if root == "" {
+		fail(w, 409, "請先在模型管理連接 "+q.Variant+" 模型。")
 		return
 	}
-	go func() { s.finish(s.render(ctx, j.ID, root, q, voice, trained)) }()
+	ctx, j, _ := s.reserveLocked(q.Engine, "synthesis")
+	go func() { s.finish(s.render(ctx, j.ID, root, v.modelPaths[q.Variant], q, voice, trained)) }()
 	send(w, 202, j)
 }
-func (s *studio) render(ctx context.Context, key, root string, q request, voice string, trained *trainedModel) error {
+func (s *studio) render(ctx context.Context, key, root, modelRoot string, q request, voice string, trained *trainedModel) error {
 	dir, e := os.MkdirTemp(s.path("outputs"), ".render-*")
 	if e != nil {
 		return e
 	}
 	defer os.RemoveAll(dir)
 	dst := filepath.Join(dir, "speech.wav")
+	splitRoot := ""
+	if modelRoot != root {
+		splitRoot = modelRoot
+	}
 	ref, emotionRef := "", ""
 	if q.Reference != "" {
 		ref = s.path("voices", q.Reference+".wav")
@@ -360,6 +365,7 @@ func (s *studio) render(ctx context.Context, key, root string, q request, voice 
 	payload, e := json.Marshal(map[string]any{
 		"id": key, "request": q, "ref": ref, "emotionRef": emotionRef, "output": dst,
 		"trained":     trained,
+		"modelRoot":   splitRoot,
 		"diagnostics": filepath.Join(dir, "execution.json"),
 	})
 	if e != nil {
@@ -391,10 +397,16 @@ func (s *studio) render(ctx context.Context, key, root string, q request, voice 
 	var diagnostics struct{ Model string }
 	_ = readJSON(filepath.Join(dir, "execution.json"), &diagnostics)
 	record := recording{ID: key, Created: time.Now().UTC(), Seconds: secs, Input: q, VoiceName: voice,
-		SampleRate: rate, Model: diagnostics.Model}
+		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: true}
 	var pack manifest
-	if readJSON(filepath.Join(root, packMetadata), &pack) == nil && pack.check(q.Engine) == nil {
+	if readJSON(filepath.Join(modelRoot, packMetadata), &pack) == nil && pack.check(q.Engine) == nil {
 		record.PackVersion = pack.Version
+	}
+	if splitRoot != "" {
+		var runtimePack manifest
+		if readJSON(filepath.Join(root, packMetadata), &runtimePack) == nil && runtimePack.check(q.Engine) == nil {
+			record.RuntimeVersion = runtimePack.Version
+		}
 	}
 	if e = writeJSON(filepath.Join(dir, "record.json"), record); e != nil {
 		return e
@@ -417,6 +429,7 @@ func (s *studio) history(w http.ResponseWriter, r *http.Request) {
 		}
 		var v recording
 		if readJSON(s.path("outputs", d.Name(), "record.json"), &v) == nil && v.ID == d.Name() {
+			v.AudioAvailable = installedFile(s.path("outputs", d.Name(), "speech.wav"))
 			items = append(items, v)
 		}
 	}

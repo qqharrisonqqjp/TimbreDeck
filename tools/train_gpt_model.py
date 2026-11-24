@@ -45,7 +45,7 @@ def latest_weights(folder, suffix):
     return max(candidates, key=lambda p: (p.stat().st_mtime_ns, p.name))
 
 
-def train(engine, features, run, gpu, epochs, batch):
+def train(engine, features, run, gpu, epochs, batch, model_root=None):
     if run.is_relative_to(features) or features.is_relative_to(run) or run.is_relative_to(engine):
         raise ValueError("choose a training run folder separate from the features and the engine")
     prepared = json.loads((features / "preparation.json").read_text(encoding="utf-8"))
@@ -53,7 +53,7 @@ def train(engine, features, run, gpu, epochs, batch):
         raise ValueError("features must be prepared for the pinned v2Pro source")
     python = engine / "runtime" / "python.exe"
     gpt = engine / "GPT_SoVITS"
-    weights = gpt / "pretrained_models"
+    weights = (model_root or engine) / "GPT_SoVITS/pretrained_models"
     s1_base = weights / "s1v3.ckpt"
     s2_generator = weights / "v2Pro/s2Gv2Pro.pth"
     s2_discriminator = weights / "v2Pro/s2Dv2Pro.pth"
@@ -73,6 +73,8 @@ def train(engine, features, run, gpu, epochs, batch):
     inputs = ("preparation.json", "2-name2text.txt", "6-name2semantic.tsv")
     options = dict(source_revision=REVISION, gpu=gpu, epochs=epochs, batch_size=batch,
                    features={name: sha256_file(features / name) for name in inputs})
+    if model_root:
+        options["model_root"] = str(model_root)
     if not run.exists():
         with tempfile.TemporaryDirectory(prefix=".gpt-train-", dir=run.parent) as temporary:
             stage = Path(temporary) / "run"
@@ -144,13 +146,15 @@ def main():
     parser.add_argument("--gpu", default="0", help="one CUDA device index")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--models", type=Path, help="separately installed v2Pro model pack root")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9]+", args.gpu) or args.epochs < 1 or args.batch < 1:
         parser.error("specify a valid CUDA device and positive training options")
     try:
         run = args.run.resolve()
         with lock_run(run):
-            train(args.engine.resolve(), args.features.resolve(), run, args.gpu, args.epochs, args.batch)
+            train(args.engine.resolve(), args.features.resolve(), run, args.gpu, args.epochs, args.batch,
+                  args.models.resolve() if args.models else None)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"{exc}\n")
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -31,10 +32,35 @@ type part struct {
 }
 type manifest struct {
 	Engine   string `json:"engine"`
+	Kind     string `json:"kind,omitempty"`
+	Variant  string `json:"variant,omitempty"`
 	Version  string `json:"version"`
 	Expanded int64  `json:"expanded"`
 	Hash     string `json:"sha256"`
 	Parts    []part `json:"parts"`
+}
+
+func validPackTarget(engine, kind, variant string) bool {
+	if !supported(engine) {
+		return false
+	}
+	switch kind {
+	case "", "runtime":
+		return variant == ""
+	case "model":
+		return slices.Contains(engineCatalog[engine].Variants, variant)
+	}
+	return false
+}
+
+func packAsset(engine, kind, variant string) string {
+	if kind == "model" {
+		return engine + "-model-" + variant
+	}
+	if kind == "runtime" {
+		return engine + "-runtime"
+	}
+	return engine
 }
 
 func (p manifest) size() int64 {
@@ -45,36 +71,40 @@ func (p manifest) size() int64 {
 	return n
 }
 func (p manifest) check(engine string) error {
-	if p.Engine != engine || !supported(engine) || !assetName.MatchString(p.Version) || !hexID(p.Hash, 64) || len(p.Parts) == 0 || len(p.Parts) > 100 || p.Expanded <= 0 || p.Expanded > 250_000_000_000 {
+	if p.Engine != engine || !validPackTarget(engine, p.Kind, p.Variant) || !assetName.MatchString(p.Version) || !hexID(p.Hash, 64) || len(p.Parts) == 0 || len(p.Parts) > 100 || p.Expanded <= 0 || p.Expanded > 250_000_000_000 {
 		return errors.New("引擎包清單無效。")
 	}
 	for i, v := range p.Parts {
-		if v.Name != fmt.Sprintf("%s-%s.zip.%03d", engine, p.Version, i+1) || v.Size <= 0 || v.Size > 1_800_000_000 || !hexID(v.Hash, 64) {
+		if v.Name != fmt.Sprintf("%s-%s.zip.%03d", packAsset(engine, p.Kind, p.Variant), p.Version, i+1) || v.Size <= 0 || v.Size > 1_800_000_000 || !hexID(v.Hash, 64) {
 			return errors.New("引擎包分卷資料無效。")
 		}
 	}
 	return nil
 }
-func fetchManifest(ctx context.Context, engine string) (manifest, error) {
+func fetchManifest(ctx context.Context, engine, kind, variant string) (manifest, error) {
 	var p manifest
-	if !supported(engine) {
-		return p, errors.New("此引擎尚未接通。")
+	if !validPackTarget(engine, kind, variant) {
+		return p, errors.New("引擎或模型版本無效。")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", packURL+"packs-v1/"+engine+".json", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", packURL+"packs-v1/"+packAsset(engine, kind, variant)+".json", nil)
 	resp, e := http.DefaultClient.Do(req)
 	if e != nil {
 		return p, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 404 {
-		return p, errors.New("這款引擎尚未發佈可下載的 Windows 引擎包。")
+		return p, errors.New("此項目暫未有可下載版本。已有本機安裝包時可以離線匯入。")
 	}
 	if resp.StatusCode != 200 {
 		return p, fmt.Errorf("讀取發佈清單失敗（HTTP %d）。", resp.StatusCode)
 	}
-	return readManifest(resp.Body, engine)
+	p, e = readManifest(resp.Body, engine)
+	if e == nil && (p.Kind != kind || p.Variant != variant) {
+		e = errors.New("發佈清單與所選項目不符。")
+	}
+	return p, e
 }
 
 func readManifest(r io.Reader, engine string) (manifest, error) {
@@ -92,7 +122,7 @@ func readManifest(r io.Reader, engine string) (manifest, error) {
 	return p, p.check(engine)
 }
 func (s *studio) packInfo(w http.ResponseWriter, r *http.Request) {
-	p, e := fetchManifest(r.Context(), r.PathValue("engine"))
+	p, e := fetchManifest(r.Context(), r.PathValue("engine"), r.URL.Query().Get("kind"), r.URL.Query().Get("variant"))
 	if e != nil {
 		fail(w, 424, e.Error())
 		return
@@ -110,7 +140,7 @@ func (s *studio) install(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	p, e := fetchManifest(r.Context(), engine)
+	p, e := fetchManifest(r.Context(), engine, r.URL.Query().Get("kind"), r.URL.Query().Get("variant"))
 	if e != nil {
 		fail(w, 424, e.Error())
 		return
@@ -186,20 +216,23 @@ func (s *studio) installedPacks(w http.ResponseWriter, r *http.Request) {
 		ID      string `json:"id"`
 		Version string `json:"version,omitempty"`
 		Active  bool   `json:"active"`
+		Managed bool   `json:"managed"`
+		Intact  bool   `json:"intact"`
 	}
 	versions := []version{}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !entry.IsDir() || !installedPackName.MatchString(name) ||
-			!s.inspect(engine, map[string]string{engine: name}).Ready {
+		if !entry.IsDir() || !installedPackName.MatchString(name) {
 			continue
 		}
-		v := version{ID: name, Active: paths[engine] == name}
-		var p manifest
-		if readJSON(filepath.Join(parent, name, packMetadata), &p) == nil && p.check(engine) == nil {
-			v.Version = p.Version
+		v := version{ID: name, Active: paths[engine] == name,
+			Intact: s.inspect(engine, map[string]string{engine: name}).EngineInstalled}
+		if p, managed := s.ownedPack(filepath.Join(parent, name), engine, name); managed {
+			v.Version, v.Managed = p.Version, true
 		}
-		versions = append(versions, v)
+		if v.Intact || v.Managed {
+			versions = append(versions, v)
+		}
 	}
 	send(w, 200, versions)
 }
@@ -216,7 +249,7 @@ func (s *studio) selectPack(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active != nil && (s.active.Status == "running" || s.active.Status == "cancelling") {
+	if s.busy() {
 		fail(w, 409, "已有作業進行中。")
 		return
 	}
@@ -224,7 +257,7 @@ func (s *studio) selectPack(w http.ResponseWriter, r *http.Request) {
 	defer s.files.Unlock()
 	info, err := os.Lstat(s.path("runtimes", engine, in.ID))
 	v := s.inspect(engine, map[string]string{engine: in.ID})
-	if err != nil || !info.IsDir() || !v.Ready {
+	if err != nil || !info.IsDir() || !v.EngineInstalled {
 		fail(w, 422, "引擎包缺少必要檔案。")
 		return
 	}
@@ -410,7 +443,7 @@ func expand(ctx context.Context, source io.ReaderAt, size int64, dst string, lim
 }
 func (s *studio) installPack(ctx context.Context, p manifest, baseURL string) error {
 	cache := s.path("cache", "packs", p.Hash)
-	if e := os.MkdirAll(cache, 0700); e != nil {
+	if e := s.ensureManagedDirectory(cache); e != nil {
 		return e
 	}
 	need := p.Expanded + p.size()
@@ -489,7 +522,10 @@ func (s *studio) installFromParts(ctx context.Context, p manifest, need int64, o
 		return errors.New("整包校驗不符。")
 	}
 	parent := s.path("runtimes", p.Engine)
-	if e = os.MkdirAll(parent, 0700); e != nil {
+	if p.Kind == "model" {
+		parent = s.path("models", p.Engine, p.Variant)
+	}
+	if e = s.ensureManagedDirectory(parent); e != nil {
 		return e
 	}
 	stage, e := os.MkdirTemp(parent, ".install-*")
@@ -500,8 +536,11 @@ func (s *studio) installFromParts(ctx context.Context, p manifest, need int64, o
 	if e = expand(ctx, parts, off, stage, p.Expanded); e != nil {
 		return e
 	}
-	if !s.inspect(p.Engine, map[string]string{p.Engine: stage}).Ready {
-		return errors.New("引擎包缺少必要檔案。")
+	if !s.packReady(p, stage) {
+		return errors.New("安裝包缺少必要檔案。")
+	}
+	if e = checkSplitContents(p, stage); e != nil {
+		return e
 	}
 	if e = writeJSON(filepath.Join(stage, packMetadata), p); e != nil {
 		return e
@@ -517,7 +556,8 @@ func (s *studio) installFromParts(ctx context.Context, p manifest, need int64, o
 	}
 	name := "pack-" + p.Hash[:16]
 	dest := filepath.Join(parent, name)
-	if !s.inspect(p.Engine, map[string]string{p.Engine: dest}).Ready {
+	existing, owned := s.ownedPack(dest, p.Engine, name)
+	if !owned || existing.Hash != p.Hash || existing.Kind != p.Kind || existing.Version != p.Version || !s.packReady(p, dest) {
 		if _, e := os.Stat(dest); e == nil {
 			name += "-" + id()[:8]
 			dest = filepath.Join(parent, name)
@@ -526,6 +566,44 @@ func (s *studio) installFromParts(ctx context.Context, p manifest, need int64, o
 			return e
 		}
 	}
+	if p.Kind == "model" {
+		return writeJSON(filepath.Join(parent, "selected.json"), name)
+	}
 	paths[p.Engine] = name
 	return writeJSON(s.path("config", "engines.json"), paths)
+}
+
+func (s *studio) packReady(p manifest, root string) bool {
+	if p.Kind == "model" {
+		return len(modelMissing(p.Engine, p.Variant, root)) == 0
+	}
+	runtime := s.inspect(p.Engine, map[string]string{p.Engine: root})
+	if p.Kind == "runtime" {
+		return runtime.EngineInstalled
+	}
+	return runtime.Ready
+}
+
+func checkSplitContents(p manifest, root string) error {
+	switch p.Kind {
+	case "runtime":
+		for _, variant := range engineCatalog[p.Engine].Variants {
+			if _, err := os.Lstat(filepath.Join(root, modelFolder(p.Engine, variant))); !os.IsNotExist(err) {
+				return errors.New("獨立引擎包內含模型資料夾。")
+			}
+		}
+	case "model":
+		folder := filepath.FromSlash(modelFolder(p.Engine, p.Variant))
+		return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil || (!entry.IsDir() && !strings.HasPrefix(relative, folder+string(filepath.Separator))) {
+				return errors.New("模型包含有模型資料夾以外的檔案。")
+			}
+			return nil
+		})
+	}
+	return nil
 }

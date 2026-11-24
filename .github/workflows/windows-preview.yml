@@ -28,6 +28,7 @@ jobs:
       - run: go test ./...
       - run: go build -trimpath -ldflags="-s -w" -o Start.exe ./studio
       - run: python tests/smoke.py Start.exe
+      - run: python tests/lifecycle.py Start.exe
       - run: python tests/training_tools.py
       - id: version
         shell: pwsh
