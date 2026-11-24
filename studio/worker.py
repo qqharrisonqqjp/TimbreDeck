@@ -4,6 +4,40 @@ from pathlib import Path
 import sys
 
 
+def observe_output(target, name, devices):
+    """Capture the waveform device before the engine copies audio to the CPU."""
+    method = getattr(target, name, None)
+    if method is None:
+        return
+
+    def observed(*args, **kwargs):
+        samples = method(*args, **kwargs)
+        device = getattr(samples, "device", None)
+        devices.add(str(device) if device is not None else "unknown")
+        return samples
+
+    setattr(target, name, observed)
+
+
+def execution_details(torch, model, modules, waveform_devices):
+    details = dict(
+        platform=sys.platform, model=model, torch_version=str(torch.__version__),
+        cuda_version=torch.version.cuda, waveform_devices=sorted(waveform_devices),
+        module_devices={name: sorted({str(p.device) for p in module.parameters()})
+                        for name, module in modules.items() if module is not None},
+    )
+    devices = {}
+    for device in sorted(waveform_devices):
+        if device.startswith("cuda:"):
+            devices[device] = dict(name=torch.cuda.get_device_name(device))
+            try:
+                devices[device]["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+            except (AttributeError, RuntimeError) as exc:
+                print(f"PyTorch peak memory unavailable: {exc}", file=sys.stderr)
+    details["cuda_devices"] = devices
+    return details
+
+
 def gpt(q, ref, output):
     import soundfile as sf
     import torch
@@ -23,6 +57,8 @@ def gpt(q, ref, output):
     # Upstream saves its settings during model loading. Keep those job-local.
     config.configs_path = str(Path(output).with_name("inference.yaml"))
     synth = TTS(config)
+    waveform_devices = set()
+    observe_output(synth.vits_model, "decode", waveform_devices)
     # In non-streaming mode upstream produces one batch. Exhaust it so an
     # exception raised after a fallback silence buffer reaches the launcher.
     (rate, samples), = synth.run(dict(
@@ -33,6 +69,10 @@ def gpt(q, ref, output):
     if not any(memoryview(samples).cast("B")):
         raise ValueError("GPT-SoVITS returned silence")
     sf.write(output, samples, rate, subtype="PCM_16")
+    modules = {name: getattr(synth, name, None) for name in
+               ("t2s_model", "vits_model", "bert_model", "cnhuhbert_model")}
+    modules["speaker_embedding"] = getattr(synth.sv_model, "embedding_model", None)
+    return execution_details(torch, "v2Pro", modules, waveform_devices)
 
 
 def load_cosy_cpu(model, llm_path, flow_path, hift_path):
@@ -61,6 +101,8 @@ def cosy(q, ref, output):
 
         with patch.object(CosyVoice3Model, "load", load_cosy_cpu):
             model = CosyVoice3(model_dir=model_dir)
+    waveform_devices = set()
+    observe_output(model.model, "token2wav", waveform_devices)
     options = dict(stream=False, speed=q["speed"])
     prefix = "You are a helpful assistant."
     end = "<|endofprompt|>"
@@ -73,6 +115,14 @@ def cosy(q, ref, output):
     with sf.SoundFile(output, "w", samplerate=model.sample_rate, channels=1, subtype="PCM_16") as wav:
         for chunk in result:
             wav.write(chunk["tts_speech"].detach().cpu().reshape(-1).numpy())
+    modules = {name: getattr(model.model, name) for name in ("llm", "flow", "hift")}
+    details = execution_details(torch, Path(model_dir).name, modules, waveform_devices)
+    details["frontend_providers"] = {
+        name: getattr(model.frontend, name).get_providers()
+        for name in ("campplus_session", "speech_tokenizer_session")
+        if getattr(model.frontend, name, None) is not None
+    }
+    return details
 
 
 def main():
@@ -80,7 +130,9 @@ def main():
     q = job["request"]
     root = Path.cwd()
     sys.path[:0] = [str(root), str(root / ("GPT_SoVITS" if q["engine"] == "gpt-sovits" else "third_party/Matcha-TTS"))]
-    (gpt if q["engine"] == "gpt-sovits" else cosy)(q, job["ref"], job["output"])
+    details = (gpt if q["engine"] == "gpt-sovits" else cosy)(q, job["ref"], job["output"])
+    details.update(job=job["id"], engine=q["engine"], mode=q["mode"])
+    Path(job["diagnostics"]).write_text(json.dumps(details) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

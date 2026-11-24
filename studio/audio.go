@@ -232,7 +232,10 @@ func (s *studio) render(ctx context.Context, key, root string, q request) error 
 	dst := filepath.Join(dir, "speech.wav")
 	ref := s.path("voices", q.Reference+".wav")
 	src, _ := assets.ReadFile("worker.py")
-	payload, e := json.Marshal(map[string]any{"request": q, "ref": ref, "output": dst})
+	payload, e := json.Marshal(map[string]any{
+		"id": key, "request": q, "ref": ref, "output": dst,
+		"diagnostics": filepath.Join(dir, "execution.json"),
+	})
 	if e != nil {
 		return e
 	}

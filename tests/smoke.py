@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 import wave
 
+from acceptance import read_execution, require_windows_cuda
+
 MANDATORY = {
     "gpt-sovits": [
         "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
@@ -29,32 +31,51 @@ MANDATORY = {
            "speech_tokenizer_v3.onnx", "CosyVoice-BlankEN/config.json")),
     ],
 }
-GPT = """
+DEVICE_FIXTURE = """
+from types import SimpleNamespace
+
+class Module:
+    def __init__(self, device):
+        self.device = device
+    def parameters(self):
+        return [SimpleNamespace(device=self.device)]
+"""
+GPT = DEVICE_FIXTURE + """
 class TTS_Config:
     default_configs = {"v2Pro": {}}
     def __init__(self, config): assert not config["custom"]["is_half"]
 class TTS:
-    def __init__(self, config): pass
+    def __init__(self, config):
+        self.t2s_model = Module("cpu")
+        self.vits_model = Module("cpu")
+        self.vits_model.decode = lambda: SimpleNamespace(device="cpu")
+        self.sv_model = None
     def run(self, args):
         if args["text"] == "失敗。":
             yield 16000, bytes(32000)
             raise RuntimeError("upstream failure after fallback audio")
         assert args["text"] == "第一句。" and args["text_lang"] == "yue"
-        assert args["prompt_text"] == "參考。" and args["speed_factor"] == 1.25
+        assert args["prompt_text"] == "參考。" and args["speed_factor"] in (1, 1.25)
+        self.vits_model.decode()
         yield 24000, bytes([1, 0]) * 2400
 """
-COSY = """
+COSY = DEVICE_FIXTURE + """
 class Audio:
+    device = "cuda:0"
     def detach(self): return self
     def cpu(self): return self
     def reshape(self, n): return self
     def numpy(self): return bytes(4800)
 class CosyVoice3:
     sample_rate = 24000
-    def __init__(self, model_dir): assert model_dir.endswith("0.5B")
+    def __init__(self, model_dir):
+        assert model_dir.endswith("0.5B")
+        self.model = SimpleNamespace(llm=Module("cuda:0"), flow=Module("cuda:0"),
+                                     hift=Module("cuda:0"), token2wav=Audio)
+        self.frontend = SimpleNamespace()
     def result(self, ref, options):
         assert ref.endswith(".wav") and options == {"stream": False, "speed": 1.25}
-        return [{"tts_speech": Audio()}] * 2
+        return [{"tts_speech": self.model.token2wav()} for _ in range(2)]
     def inference_zero_shot(self, text, prompt, ref, **options):
         assert prompt == "You are a helpful assistant.<|endofprompt|>參考。"
         return self.result(ref, options)
@@ -64,6 +85,19 @@ class CosyVoice3:
     def inference_cross_lingual(self, text, ref, **options):
         assert text.startswith("You are a helpful assistant.<|endofprompt|>")
         return self.result(ref, options)
+"""
+TORCH = """
+from types import SimpleNamespace
+__version__ = "fixture"
+version = SimpleNamespace(cuda=None)
+class cuda:
+    is_available = staticmethod(lambda: False)
+"""
+CUDA_TORCH = TORCH + """
+version.cuda = "fixture"
+cuda.is_available = staticmethod(lambda: True)
+cuda.get_device_name = staticmethod(lambda device: "fixture GPU")
+cuda.max_memory_allocated = staticmethod(lambda device: 4096)
 """
 SOUNDFILE = """
 import wave
@@ -100,12 +134,43 @@ def fixtures(root):
             target.symlink_to(sys.executable)
         file(pkg / "soundfile.py", SOUNDFILE)
         if engine == "cosyvoice3":
-            file(pkg / "torch.py", "class cuda:\n    is_available = staticmethod(lambda: True)\n")
+            file(pkg / "torch.py", CUDA_TORCH)
             file(pkg / "cosyvoice/cli/cosyvoice.py", COSY)
         else:
             file(pkg / "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin", "test fixture")
-            file(pkg / "torch.py", "class cuda:\n    is_available = staticmethod(lambda: False)\n")
+            file(pkg / "torch.py", TORCH)
             file(pkg / "GPT_SoVITS/TTS_infer_pack/TTS.py", GPT)
+
+
+def expect_value_error(fn, *args):
+    try:
+        fn(*args)
+    except ValueError:
+        return
+    raise AssertionError(f"{fn.__name__} accepted invalid evidence")
+
+
+def check_execution(root, key, engine, mode):
+    details = read_execution(root, key, engine, mode)
+    assert details["platform"] == sys.platform
+    expect_value_error(read_execution, root, key, "another-engine", mode)
+    assert read_execution(root, "0" * 32, engine, mode) is None
+    expect_value_error(require_windows_cuda, None)
+    windows = dict(details, platform="win32")
+    if engine == "gpt-sovits":
+        assert details["waveform_devices"] == ["cpu"]
+        expect_value_error(require_windows_cuda, windows)
+    else:
+        assert details["waveform_devices"] == ["cuda:0"]
+        assert details["cuda_devices"]["cuda:0"]["peak_allocated_bytes"] == 4096
+        require_windows_cuda(windows)
+        expect_value_error(require_windows_cuda, dict(windows, platform="linux"))
+        expect_value_error(require_windows_cuda, dict(windows, module_devices={}))
+        expect_value_error(require_windows_cuda, dict(windows, waveform_devices=["cuda:0", "cpu"]))
+    path = root / "outputs" / key / "execution.json"
+    file(path, json.dumps(dict(details, job="another-job")))
+    expect_value_error(read_execution, root, key, engine, mode)
+    file(path, json.dumps(details))
 
 
 def main():
@@ -156,6 +221,7 @@ def main():
                 with wave.open(io.BytesIO(audio)) as result:
                     assert result.getframerate() == 24000
                     assert result.getnframes() == (2400 if engine == "gpt-sovits" else 4800)
+                check_execution(root, key, engine, mode)
             failed = dict(request, engine="gpt-sovits", mode="clone", text="失敗。")
             api("/api/synthesize", failed)
             deadline = time.monotonic() + 20

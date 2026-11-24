@@ -37,6 +37,10 @@ python tests/acceptance.py .\Start.exe .\reference.wav "今日天氣幾好，我
 
 只傳入其中一個引擎路徑也可測試。每個成功的引擎會輸出以引擎命名的 WAV。`comparison.json` 記錄輸入及輸出雜湊、取樣率、長度、峰值、耗時及失敗原因。報告的 generated 代表已取得有訊號的音檔；粵語讀音、語尾及音色相似度須另外試聽。
 
+在有 NVIDIA 顯示卡的 Windows 上，使用本版本重新建置的 `Start.exe`，在上面的命令加上 `--require-cuda`。驗收工具會核對每個音檔所屬作業的 `execution.json`，確認實際產生波形的張量，以及主合成模型的參數，都在同一個 CUDA 裝置。任何引擎缺少證據或回退到 CPU 時，報告會標示 `cuda_status: failed` 並回傳非零退出碼，供試聽的有效音檔仍會保存。
+
+`comparison.json` 同時保留各作業的模型、PyTorch 與 CUDA 版本、GPU 名稱及可取得的 PyTorch 峰值分配量。峰值只計 PyTorch 在該程序內分配的記憶體。CosyVoice 的 ONNX 前處理執行提供者另行記錄。執行時請在驗收記錄另填 Windows 版本、NVIDIA 驅動及引擎包版本。
+
 ## Engine pack publishing
 
 Prepare a tested engine root with the above layout, third-party license notices, matching source revisions, complete offline weights, and its portable interpreter and dependencies. Package from a separate output directory:

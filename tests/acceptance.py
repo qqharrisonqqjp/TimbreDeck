@@ -5,12 +5,48 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 import wave
+
+
+CUDA_MODULES = {
+    "gpt-sovits": ("t2s_model", "vits_model"),
+    "cosyvoice3": ("llm", "flow", "hift"),
+}
+
+
+def read_execution(target, key, engine, mode):
+    path = target / "outputs" / key / "execution.json"
+    if not path.is_file():
+        return None
+    details = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(details, dict) or details.get("job") != key
+            or details.get("engine") != engine or details.get("mode") != mode):
+        raise ValueError("execution diagnostics do not match the completed job")
+    return details
+
+
+def require_windows_cuda(details):
+    if details is None:
+        raise ValueError("missing execution diagnostics for the completed job")
+    if details.get("platform") != "win32":
+        raise ValueError("the synthesis worker did not run on Windows")
+    waveform = details.get("waveform_devices")
+    if (not isinstance(waveform, list) or len(waveform) != 1
+            or not isinstance(waveform[0], str) or not re.fullmatch(r"cuda:[0-9]+", waveform[0])):
+        raise ValueError(f"the waveform was not produced on one CUDA device: {waveform}")
+    modules = details.get("module_devices", {})
+    for name in CUDA_MODULES[details["engine"]]:
+        if modules.get(name) != waveform:
+            raise ValueError(f"{name} was not on the waveform's CUDA device: {modules.get(name)}")
+    device = details.get("cuda_devices", {}).get(waveform[0], {})
+    if not all((device.get("name"), details.get("torch_version"), details.get("cuda_version"))):
+        raise ValueError("missing CUDA device or PyTorch runtime details")
 
 
 def measure(audio):
@@ -37,6 +73,8 @@ def main():
     cli.add_argument("--cosy", type=Path, help="complete CosyVoice 3 root")
     cli.add_argument("--text", default="今晚八點半喺旺角站等。")
     cli.add_argument("--timeout", type=int, default=1200, help="seconds per engine")
+    cli.add_argument("--require-cuda", action="store_true",
+                     help="require job-linked Windows CUDA evidence for every selected engine")
     args = cli.parse_args()
     engines = {k: p for k, p in (("gpt-sovits", args.gpt), ("cosyvoice3", args.cosy)) if p}
     if not engines or args.timeout <= 0:
@@ -44,7 +82,8 @@ def main():
     audio = args.reference.read_bytes()
     target = args.destination.resolve()
     target.mkdir(parents=True, exist_ok=False)
-    report = dict(reference_sha256=hashlib.sha256(audio).hexdigest(), text=args.text, engines={})
+    report = dict(reference_sha256=hashlib.sha256(audio).hexdigest(), text=args.text,
+                  require_cuda=args.require_cuda, engines={})
     launcher = subprocess.Popen([str(args.launcher.resolve()), "-no-browser", "-data", str(target)],
                                 stdout=subprocess.PIPE, encoding="utf-8")
     try:
@@ -62,12 +101,14 @@ def main():
                 raise RuntimeError(exc.read().decode(errors="replace")) from exc
 
         ref = api("reference", audio)
-        if len(engines) == 2 and not 3 <= ref["seconds"] <= 10:
-            raise ValueError("the shared reference must be 3–10 seconds for GPT-SoVITS")
         for engine, root in engines.items():
             start = time.monotonic()
             entry = report["engines"][engine] = dict(status="failed")
+            if args.require_cuda:
+                entry["cuda_status"] = "failed"
             try:
+                if engine == "gpt-sovits" and not 3 <= ref["seconds"] <= 10:
+                    raise ValueError("the reference must be 3–10 seconds for GPT-SoVITS")
                 api("engine", dict(engine=engine, path=str(root.resolve())))
                 req = dict(engine=engine, mode="clone", reference=ref["id"], preview=False,
                            text=args.text, transcript=args.transcript, speed=1,
@@ -101,6 +142,12 @@ def main():
                     raise ValueError("output is identical to the reference")
                 (target / (engine + ".wav")).write_bytes(wav)
                 entry["status"] = "generated"
+                execution = read_execution(target, key, engine, req["mode"])
+                if execution is not None:
+                    entry["execution"] = execution
+                if args.require_cuda:
+                    require_windows_cuda(execution)
+                    entry["cuda_status"] = "passed"
             except Exception as exc:
                 entry["error"] = str(exc)
             finally:
@@ -110,7 +157,7 @@ def main():
     finally:
         launcher.terminate()
         launcher.wait(timeout=15)
-    return int(any(e["status"] != "generated" for e in report["engines"].values()))
+    return int(any(e["status"] != "generated" or "error" in e for e in report["engines"].values()))
 
 
 if __name__ == "__main__":
