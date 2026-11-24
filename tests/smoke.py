@@ -30,6 +30,26 @@ MANDATORY = {
           ("cosyvoice3.yaml", "llm.pt", "flow.pt", "hift.pt", "campplus.onnx",
            "speech_tokenizer_v3.onnx", "CosyVoice-BlankEN/config.json")),
     ],
+    "voxcpm2": [
+        "src/voxcpm/core.py",
+        *("pretrained_models/VoxCPM2/" + name for name in
+          ("config.json", "tokenizer.json", "model.safetensors", "audiovae.safetensors")),
+    ],
+    "indextts2": [
+        *("checkpoints/" + name for name in
+          ("config.yaml", "gpt.pth", "s2mel.pth", "bpe.model", "wav2vec2bert_stats.pt",
+           "feat1.pt", "feat2.pt", "qwen0.6bemo4-merge/config.json", "qwen0.6bemo4-merge/model.safetensors")),
+        *(f"checkpoints/hf_cache/models--{repo}/refs/main" for repo in
+          ("facebook--w2v-bert-2.0", "amphion--MaskGCT", "funasr--campplus",
+           "nvidia--bigvgan_v2_22khz_80band_256x")),
+    ],
+    "qwen3-tts": [
+        "qwen_tts/inference/qwen3_tts_model.py",
+        *(f"pretrained_models/Qwen3-TTS-12Hz-1.7B-{variant}/{name}"
+          for variant in ("Base", "CustomVoice")
+          for name in ("config.json", "model.safetensors", "generation_config.json", "tokenizer_config.json",
+                       "speech_tokenizer/config.json", "speech_tokenizer/model.safetensors")),
+    ],
 }
 DEVICE_FIXTURE = """
 from types import SimpleNamespace
@@ -90,8 +110,78 @@ TORCH = """
 from types import SimpleNamespace
 __version__ = "fixture"
 version = SimpleNamespace(cuda=None)
+float32 = "float32"
 class cuda:
     is_available = staticmethod(lambda: False)
+"""
+VOX = DEVICE_FIXTURE + """
+class VoxCPM:
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        assert path == "pretrained_models/VoxCPM2"
+        assert kwargs == dict(load_denoiser=False, local_files_only=True, optimize=False)
+        model = cls()
+        model.tts_model = Module("cpu")
+        model.tts_model.sample_rate = 48000
+        model.tts_model.audio_vae = SimpleNamespace(decode=lambda: SimpleNamespace(device="cpu"))
+        return model
+    def generate(self, text, **kwargs):
+        if text.startswith("(清朗)"):
+            assert text == "(清朗)第一句。"
+            assert not kwargs or kwargs["reference_wav_path"].endswith(".wav")
+        else:
+            assert kwargs["prompt_wav_path"] == kwargs["reference_wav_path"]
+            assert kwargs["prompt_text"] == "參考。"
+        self.tts_model.audio_vae.decode()
+        return bytes([1, 0, 2, 0]) * 100
+"""
+INDEX = DEVICE_FIXTURE + """
+class Samples(bytes):
+    def reshape(self, size): return self
+class IndexTTS2:
+    def __init__(self, **kwargs):
+        assert kwargs == dict(use_cuda_kernel=False, use_deepspeed=False)
+        for name in ("gpt", "semantic_model", "semantic_codec", "s2mel", "bigvgan"):
+            setattr(self, name, Module("cpu"))
+        self.bigvgan.forward = lambda: SimpleNamespace(device="cpu")
+    def infer(self, spk_audio_prompt, text, output_path, **kwargs):
+        assert spk_audio_prompt.endswith(".wav") and output_path is None
+        assert text == "第一句。"
+        if kwargs:
+            if "emo_audio_prompt" in kwargs:
+                assert kwargs["emo_audio_prompt"] != spk_audio_prompt
+                assert kwargs["emo_audio_prompt"].endswith(".wav")
+                assert kwargs["emo_alpha"] == 0
+            elif "emo_text" in kwargs:
+                assert kwargs == dict(use_emo_text=True, emo_text="愉快", emo_alpha=1)
+            else:
+                assert kwargs == dict(emo_vector=[0.2] + [0] * 7, emo_alpha=1)
+        self.bigvgan.forward()
+        return 22050, Samples(bytes([1, 0, 2, 0]) * 100)
+"""
+QWEN = DEVICE_FIXTURE + """
+class Qwen3TTSModel:
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        assert kwargs == dict(device_map="cpu", dtype="float32",
+                              attn_implementation="sdpa", local_files_only=True)
+        model = cls()
+        model.variant = path.rsplit("-", 1)[1]
+        model.model = Module("cpu")
+        return model
+    def result(self, text, language):
+        assert text == "第一句。" and language == "Chinese"
+        return [bytes([1, 0, 2, 0]) * 100], 24000
+    def generate_voice_clone(self, ref_audio, ref_text, x_vector_only_mode, **kwargs):
+        assert self.variant == "Base" and ref_audio.endswith(".wav")
+        assert ref_text == (None if x_vector_only_mode else "參考。")
+        return self.result(**kwargs)
+    def generate_custom_voice(self, speaker, instruct, **kwargs):
+        assert self.variant == "CustomVoice" and speaker == "Vivian" and instruct == "節奏稍慢"
+        return self.result(**kwargs)
+    def generate_voice_design(self, instruct, **kwargs):
+        assert self.variant == "VoiceDesign" and instruct == "清朗"
+        return self.result(**kwargs)
 """
 CUDA_TORCH = TORCH + """
 version.cuda = "fixture"
@@ -136,10 +226,18 @@ def fixtures(root):
         if engine == "cosyvoice3":
             file(pkg / "torch.py", CUDA_TORCH)
             file(pkg / "cosyvoice/cli/cosyvoice.py", COSY)
-        else:
+        elif engine == "gpt-sovits":
             file(pkg / "GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin", "test fixture")
             file(pkg / "torch.py", TORCH)
             file(pkg / "GPT_SoVITS/TTS_infer_pack/TTS.py", GPT)
+        else:
+            adapter_file, adapter = {
+                "voxcpm2": ("src/voxcpm/__init__.py", VOX),
+                "indextts2": ("indextts/infer_v2.py", INDEX),
+                "qwen3-tts": ("qwen_tts/__init__.py", QWEN),
+            }[engine]
+            file(pkg / "torch.py", TORCH)
+            file(pkg / adapter_file, adapter)
 
 
 def expect_value_error(fn, *args):
@@ -195,6 +293,66 @@ def check_acceptance(binary, root, reference):
         assert (target / "gpt-sovits.wav").is_file()
 
 
+def expect_http_error(api, code, path, data):
+    try:
+        api(path, data)
+    except urllib.error.HTTPError as err:
+        assert err.code == code, err.read()
+    else:
+        raise AssertionError(f"{path} accepted an invalid request")
+
+
+def check_new_engines(api, root, ref, emotion):
+    profile = api("/api/profiles", dict(name="粵語角色", reference=ref, transcript="參考。", language="yue"))
+    voice = profile["id"]
+    assert api("/api/profiles") == [profile]
+    common = dict(text="第一句。", speed=1, language="zh")
+    cases = [
+        ("voxcpm2", "clone", 48000, dict(voiceId=voice, instruction="清朗")),
+        ("voxcpm2", "continue", 48000, dict(voiceId=voice)),
+        ("voxcpm2", "design", 48000, dict(instruction="清朗")),
+        ("indextts2", "clone", 22050, dict(reference=ref)),
+        ("indextts2", "emotion-audio", 22050, dict(reference=ref, emotionReference=emotion, emotionStrength=0)),
+        ("indextts2", "emotion-text", 22050, dict(reference=ref, instruction="愉快")),
+        ("indextts2", "emotion-vector", 22050, dict(reference=ref, emotionWeights=[0.2] + [0] * 7)),
+        ("qwen3-tts", "clone", 24000, dict(voiceId=voice)),
+        ("qwen3-tts", "simple-clone", 24000, dict(reference=ref)),
+        ("qwen3-tts", "preset", 24000, dict(speaker="Vivian", instruction="節奏稍慢")),
+        ("qwen3-tts", "design", 24000, dict(instruction="清朗")),
+    ]
+    design = dict(common, engine="qwen3-tts", mode="design", instruction="清朗")
+    expect_http_error(api, 409, "/api/synthesize", design)
+    expect_http_error(api, 422, "/api/synthesize", dict(design, variant="Base"))
+    expect_http_error(api, 422, "/api/synthesize", dict(design, instruction=""))
+    expect_http_error(api, 422, "/api/synthesize", dict(common, engine="indextts2",
+                      mode="emotion-vector", reference=ref, emotionWeights=[0.2]))
+    for name in ("config.json", "model.safetensors", "generation_config.json", "tokenizer_config.json",
+                 "speech_tokenizer/config.json", "speech_tokenizer/model.safetensors"):
+        file(root / "runtimes/qwen3-tts/pretrained_models/Qwen3-TTS-12Hz-1.7B-VoiceDesign" / name, "fixture")
+    for engine, mode, rate, options in cases:
+        payload = dict(common, engine=engine, mode=mode, **options)
+        key = api("/api/synthesize", payload)["id"]
+        until = time.monotonic() + 20
+        while time.monotonic() < until:
+            job = api("/api/job")
+            if job["status"] != "running":
+                break
+            time.sleep(.1)
+        if job["status"] != "done":
+            raise AssertionError((job, (root / "logs" / (key + ".log")).read_text(errors="replace")))
+        record = api("/api/history")[0]
+        assert record["id"] == key and record["sampleRate"] == rate
+        if options.get("voiceId"):
+            assert record["voiceName"] == profile["name"] and record["input"]["reference"] == ref
+        with wave.open(io.BytesIO(api("/api/audio/" + key + "?download=1"))) as output:
+            assert output.getframerate() == rate and output.getnframes() == 200
+    api("/api/profiles/" + voice, dict(profile, name="新名稱"), method="PUT")
+    assert api("/api/profiles")[0]["name"] == "新名稱"
+    api("/api/profiles/" + voice, method="DELETE")
+    assert not api("/api/profiles") and api("/api/reference/" + ref)
+    assert any(x.get("voiceName") == "粵語角色" for x in api("/api/history"))
+
+
 def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("binary", type=Path)
@@ -226,8 +384,8 @@ def main():
                 ("clone", True, True, False), ("instruct", True, False, True),
                 ("cross", True, False, False),
             ]
-            assert not state["engines"]["qwen3-tts"].get("modes")
             assert state["engines"]["qwen3-tts"]["variants"] == ["Base", "CustomVoice", "VoiceDesign"]
+            assert state["engines"]["qwen3-tts"]["availableVariants"] == ["Base", "CustomVoice"]
             wav = io.BytesIO()
             with wave.open(wav, "wb") as out:
                 out.setparams((1, 2, 16000, 0, "NONE", "NONE"))
@@ -270,11 +428,15 @@ def main():
                 time.sleep(.1)
             assert api("/api/job")["status"] == "failed"
             assert len(api("/api/history")) == 4
+            emotion_audio = bytearray(wav.getvalue())
+            emotion_audio[-1] = 1
+            emotion = api("/api/reference", bytes(emotion_audio))["id"]
+            check_new_engines(api, root, ref, emotion)
         finally:
             runtime.terminate()
             runtime.wait(timeout=15)
         check_acceptance(args.binary, root, wav.getvalue())
-    print("Launcher HTTP, four adapter contracts, history, WAV export and CUDA acceptance checks passed.")
+    print("Launcher HTTP, 15 synthesis modes, profiles, history, WAV export and CUDA acceptance checks passed.")
 
 
 if __name__ == "__main__":

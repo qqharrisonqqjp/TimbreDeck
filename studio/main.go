@@ -47,13 +47,15 @@ type settings struct {
 	Text          string                     `json:"text"`
 	Reference     string                     `json:"reference"`
 	ReferenceName string                     `json:"referenceName"`
+	VoiceID       string                     `json:"voiceId,omitempty"`
 	Drafts        map[string]json.RawMessage `json:"drafts"`
 }
 type installation struct {
 	engineCapabilities
-	Path    string   `json:"path"`
-	Ready   bool     `json:"ready"`
-	Missing []string `json:"missing,omitempty"`
+	Path              string   `json:"path"`
+	Ready             bool     `json:"ready"`
+	Missing           []string `json:"missing,omitempty"`
+	AvailableVariants []string `json:"availableVariants,omitempty"`
 }
 
 func id() string {
@@ -118,6 +120,9 @@ func openStudio(root string) (*studio, error) {
 			return nil, e
 		}
 	}
+	if e = os.MkdirAll(filepath.Join(abs, "voices", "profiles"), 0700); e != nil {
+		return nil, e
+	}
 	return &studio{root: abs}, nil
 }
 func (s *studio) path(parts ...string) string { return filepath.Join(s.root, filepath.Join(parts...)) }
@@ -130,7 +135,8 @@ func (s *studio) paths() (map[string]string, error) {
 	return m, e
 }
 func required(engine string) []string {
-	if engine == "gpt-sovits" {
+	switch engine {
+	case "gpt-sovits":
 		return []string{
 			"runtime/python.exe",
 			"GPT_SoVITS/TTS_infer_pack/TTS.py",
@@ -140,19 +146,59 @@ func required(engine string) []string {
 			"GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/config.json",
 			"GPT_SoVITS/pretrained_models/chinese-hubert-base/config.json",
 		}
+	case "cosyvoice3":
+		return []string{
+			"runtime/python.exe",
+			"cosyvoice/cli/cosyvoice.py",
+			"third_party/Matcha-TTS/matcha/models/components/decoder.py",
+			"pretrained_models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml",
+			"pretrained_models/Fun-CosyVoice3-0.5B/llm.pt",
+			"pretrained_models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN/config.json",
+			"pretrained_models/Fun-CosyVoice3-0.5B/flow.pt",
+			"pretrained_models/Fun-CosyVoice3-0.5B/hift.pt",
+			"pretrained_models/Fun-CosyVoice3-0.5B/campplus.onnx",
+			"pretrained_models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx",
+		}
+	case "voxcpm2":
+		return []string{
+			"runtime/python.exe", "src/voxcpm/core.py",
+			"pretrained_models/VoxCPM2/config.json", "pretrained_models/VoxCPM2/tokenizer.json",
+			"pretrained_models/VoxCPM2/model.safetensors|pretrained_models/VoxCPM2/pytorch_model.bin",
+			"pretrained_models/VoxCPM2/audiovae.safetensors|pretrained_models/VoxCPM2/audiovae.pth",
+		}
+	case "indextts2":
+		return []string{
+			"runtime/python.exe", "indextts/infer_v2.py", "checkpoints/config.yaml",
+			"checkpoints/gpt.pth", "checkpoints/s2mel.pth", "checkpoints/bpe.model",
+			"checkpoints/wav2vec2bert_stats.pt", "checkpoints/feat1.pt", "checkpoints/feat2.pt",
+			"checkpoints/qwen0.6bemo4-merge/config.json",
+			"checkpoints/qwen0.6bemo4-merge/model.safetensors|checkpoints/qwen0.6bemo4-merge/pytorch_model.bin",
+			"checkpoints/hf_cache/models--facebook--w2v-bert-2.0/refs/main",
+			"checkpoints/hf_cache/models--amphion--MaskGCT/refs/main",
+			"checkpoints/hf_cache/models--funasr--campplus/refs/main",
+			"checkpoints/hf_cache/models--nvidia--bigvgan_v2_22khz_80band_256x/refs/main",
+		}
+	case "qwen3-tts":
+		return []string{"runtime/python.exe", "qwen_tts/inference/qwen3_tts_model.py"}
 	}
-	return []string{
-		"runtime/python.exe",
-		"cosyvoice/cli/cosyvoice.py",
-		"third_party/Matcha-TTS/matcha/models/components/decoder.py",
-		"pretrained_models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml",
-		"pretrained_models/Fun-CosyVoice3-0.5B/llm.pt",
-		"pretrained_models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN/config.json",
-		"pretrained_models/Fun-CosyVoice3-0.5B/flow.pt",
-		"pretrained_models/Fun-CosyVoice3-0.5B/hift.pt",
-		"pretrained_models/Fun-CosyVoice3-0.5B/campplus.onnx",
-		"pretrained_models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx",
+	return nil
+}
+
+func missingFiles(root string, requirements []string) []string {
+	var missing []string
+	for _, alternatives := range requirements {
+		found := false
+		for _, name := range strings.Split(alternatives, "|") {
+			if installedFile(filepath.Join(root, name)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, strings.ReplaceAll(alternatives, "|", " 或 "))
+		}
 	}
+	return missing
 }
 
 // Source archives can contain Git LFS pointers in place of actual weights.
@@ -176,9 +222,21 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 	if !supported(engine) {
 		return v
 	}
-	for _, f := range required(engine) {
-		if !installedFile(filepath.Join(p, f)) {
-			v.Missing = append(v.Missing, f)
+	v.Missing = missingFiles(p, required(engine))
+	if engine == "qwen3-tts" {
+		for _, variant := range v.Variants {
+			model := filepath.Join(p, "pretrained_models", "Qwen3-TTS-12Hz-1.7B-"+variant)
+			files := []string{
+				"config.json", "model.safetensors|model.safetensors.index.json",
+				"generation_config.json", "tokenizer_config.json", "speech_tokenizer/config.json",
+				"speech_tokenizer/model.safetensors",
+			}
+			if len(missingFiles(model, files)) == 0 {
+				v.AvailableVariants = append(v.AvailableVariants, variant)
+			}
+		}
+		if len(v.AvailableVariants) == 0 {
+			v.Missing = append(v.Missing, "pretrained_models/Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice,VoiceDesign}")
 		}
 	}
 	v.Ready = len(v.Missing) == 0
@@ -193,7 +251,8 @@ func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 		if !decode(w, r, &d) {
 			return
 		}
-		if !known(d.Engine) || (d.Reference != "" && !hexID(d.Reference, 64)) {
+		if !known(d.Engine) || (d.Reference != "" && !hexID(d.Reference, 64)) ||
+			(d.VoiceID != "" && !hexID(d.VoiceID, 32)) {
 			fail(w, 400, "草稿資料有誤。")
 			return
 		}
@@ -288,6 +347,10 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("PUT /api/draft", s.config)
 	m.HandleFunc("POST /api/engine", s.setPath)
 	m.HandleFunc("POST /api/reference", s.reference)
+	m.HandleFunc("GET /api/profiles", s.profiles)
+	m.HandleFunc("POST /api/profiles", s.saveProfile)
+	m.HandleFunc("PUT /api/profiles/{id}", s.saveProfile)
+	m.HandleFunc("DELETE /api/profiles/{id}", s.removeProfile)
 	m.HandleFunc("POST /api/synthesize", s.synthesize)
 	m.HandleFunc("GET /api/history", s.history)
 	m.HandleFunc("GET /api/audio/{id}", s.audio)

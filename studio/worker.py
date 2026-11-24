@@ -38,7 +38,7 @@ def execution_details(torch, model, modules, waveform_devices):
     return details
 
 
-def gpt(q, ref, output):
+def gpt(q, ref, output, _emotion_ref):
     import soundfile as sf
     import torch
     from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
@@ -87,7 +87,7 @@ def load_cosy_cpu(model, llm_path, flow_path, hift_path):
         module.eval()
 
 
-def cosy(q, ref, output):
+def cosy(q, ref, output, _emotion_ref):
     import soundfile as sf
     from cosyvoice.cli.cosyvoice import CosyVoice3
 
@@ -125,12 +125,102 @@ def cosy(q, ref, output):
     return details
 
 
+def vox(q, ref, output, _emotion_ref):
+    import soundfile as sf
+    import torch
+    from voxcpm import VoxCPM
+
+    model = VoxCPM.from_pretrained(
+        "pretrained_models/VoxCPM2", load_denoiser=False, local_files_only=True, optimize=False,
+    )
+    waveform_devices = set()
+    observe_output(model.tts_model.audio_vae, "decode", waveform_devices)
+    options = {"reference_wav_path": ref} if ref else {}
+    text = q["text"]
+    if q["mode"] == "continue":
+        options.update(prompt_wav_path=ref, prompt_text=q["transcript"])
+    elif q["instruction"]:
+        text = f"({q['instruction']}){text}"
+    samples = model.generate(text=text, **options)
+    sf.write(output, samples, model.tts_model.sample_rate, subtype="PCM_16")
+    return execution_details(torch, "VoxCPM2", {"tts": model.tts_model}, waveform_devices)
+
+
+def index(q, ref, output, emotion_ref):
+    import soundfile as sf
+    import torch
+    from indextts.infer_v2 import IndexTTS2
+
+    model = IndexTTS2(use_cuda_kernel=False, use_deepspeed=False)
+    waveform_devices = set()
+    observe_output(model.bigvgan, "forward", waveform_devices)
+    options = {}
+    if q["mode"] == "emotion-audio":
+        options["emo_audio_prompt"] = emotion_ref
+    elif q["mode"] == "emotion-text":
+        options.update(use_emo_text=True, emo_text=q["instruction"])
+    elif q["mode"] == "emotion-vector":
+        options["emo_vector"] = q["emotionWeights"]
+    if options:
+        options["emo_alpha"] = q.get("emotionStrength", 1.0)
+    rate, samples = model.infer(spk_audio_prompt=ref, text=q["text"], output_path=None, **options)
+    sf.write(output, samples.reshape(-1), rate, subtype="PCM_16")
+    modules = {name: getattr(model, name) for name in ("gpt", "semantic_model", "semantic_codec", "s2mel", "bigvgan")}
+    return execution_details(torch, "IndexTTS-2", modules, waveform_devices)
+
+
+QWEN_LANGUAGES = {
+    "auto": "Auto", "zh": "Chinese", "en": "English", "ja": "Japanese",
+    "ko": "Korean", "de": "German", "fr": "French", "ru": "Russian",
+    "pt": "Portuguese", "es": "Spanish", "it": "Italian",
+}
+
+
+def qwen(q, ref, output, _emotion_ref):
+    import soundfile as sf
+    import torch
+    from qwen_tts import Qwen3TTSModel
+
+    name = "Qwen3-TTS-12Hz-1.7B-" + q["variant"]
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device != "cpu" and torch.cuda.is_bf16_supported() else torch.float32
+    model = Qwen3TTSModel.from_pretrained(
+        str(Path("pretrained_models") / name), device_map=device, dtype=dtype,
+        attn_implementation="sdpa", local_files_only=True,
+    )
+    options = dict(text=q["text"], language=QWEN_LANGUAGES[q["language"]])
+    if q["mode"] == "design":
+        wavs, rate = model.generate_voice_design(instruct=q["instruction"], **options)
+    elif q["mode"] == "preset":
+        wavs, rate = model.generate_custom_voice(speaker=q["speaker"], instruct=q["instruction"] or None, **options)
+    else:
+        simple = q["mode"] == "simple-clone"
+        wavs, rate = model.generate_voice_clone(
+            ref_audio=ref, ref_text=None if simple else q["transcript"], x_vector_only_mode=simple, **options,
+        )
+    samples, = wavs
+    sf.write(output, samples, rate, subtype="PCM_16")
+    return execution_details(torch, name, {"tts": model.model}, set())
+
+
+ADAPTERS = {
+    "gpt-sovits": (gpt, "GPT_SoVITS"),
+    "cosyvoice3": (cosy, "third_party/Matcha-TTS"),
+    "voxcpm2": (vox, "src"),
+    "indextts2": (index, ""),
+    "qwen3-tts": (qwen, ""),
+}
+
+
 def main():
     job = json.load(sys.stdin)
     q = job["request"]
     root = Path.cwd()
-    sys.path[:0] = [str(root), str(root / ("GPT_SoVITS" if q["engine"] == "gpt-sovits" else "third_party/Matcha-TTS"))]
-    details = (gpt if q["engine"] == "gpt-sovits" else cosy)(q, job["ref"], job["output"])
+    adapter, imports = ADAPTERS[q["engine"]]
+    sys.path.insert(0, str(root))
+    if imports:
+        sys.path.insert(1, str(root / imports))
+    details = adapter(q, job["ref"], job["output"], job["emotionRef"])
     details.update(job=job["id"], engine=q["engine"], mode=q["mode"])
     Path(job["diagnostics"]).write_text(json.dumps(details) + "\n", encoding="utf-8")
 

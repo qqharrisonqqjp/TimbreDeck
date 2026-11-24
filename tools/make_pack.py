@@ -10,7 +10,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("engine", choices=("gpt-sovits", "cosyvoice3"))
+    parser.add_argument("engine", choices=("gpt-sovits", "cosyvoice3", "voxcpm2", "indextts2", "qwen3-tts"))
     parser.add_argument("version")
     parser.add_argument("root", type=Path)
     parser.add_argument("out", type=Path)
@@ -49,8 +49,13 @@ def main():
                         data = src.read(min(1024 * 1024, remaining))
                 parts.append(dict(name=path.name, bytes=length, sha256=digest.hexdigest()))
         manifest = dict(engine=args.engine, version=args.version, expanded=size, sha256=whole.hexdigest(), parts=parts)
+        if size <= 0 or size > 250_000_000_000 or len(parts) > 100:
+            parser.error("the archive exceeds the launcher's size or part limits")
         info = stage / f"{args.engine}.json"
         info.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        for part in parts:
+            if (out / part["name"]).exists():
+                parser.error(f"{part['name']} already exists; use a new version or output directory")
         for part in parts:
             (stage / part["name"]).replace(out / part["name"])
         info.replace(out / info.name)

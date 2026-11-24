@@ -3,7 +3,7 @@
 ## 開始使用
 
 1. 從 [Releases（發佈頁）](https://github.com/qqharrisonqqjp/TimbreDeck/releases) 下載 `TimbreDeck-Windows-x64.zip`，解壓到自己可寫入的資料夾。雙擊 `Start.exe`。啟動器會開啟預設瀏覽器。工作期間保留主控台，若瀏覽器未自動開啟，可複製主控台顯示的本機網址。
-2. 在右上角選 GPT-SoVITS 或 CosyVoice 3，開啟「模型管理」。可連接已有的完整引擎資料夾，或把它放進下表的預設位置再按「重新偵測」。顯示「已找到引擎檔案」代表已找到檢查項目，首次合成才會載入模型。大型引擎包仍待發佈。
+2. 在右上角選引擎，開啟「模型管理」。可連接已有的完整引擎資料夾，或把它放進下表的預設位置再按「重新偵測」。顯示「已找到引擎檔案」代表已找到檢查項目，首次合成才會載入模型。大型引擎包仍待發佈。
 3. 回到「語音合成」並匯入參考 WAV。GPT-SoVITS 需要 3 至 10 秒的清晰錄音。錄音複製需填寫正確逐字稿。CosyVoice 的指令朗讀模式另有「講法指示」，例如「請用廣東話，節奏稍慢」。
 4. 在「要讀出的文字」填寫新的台詞，選擇「試讀第一句」或「生成全文」。作業期間可以切換畫面，或按「取消作業」。在「輸出歷史」可預聽並匯出 WAV。每次合成使用獨立引擎程序，載入模型需時。完成或取消後會結束該程序。
 5. 主控台按 Ctrl+C 結束。複製整個資料夾可帶走草稿、匯入錄音和輸出。外接的引擎若搬遷，請重新指定路徑。
@@ -12,6 +12,13 @@
 |---|---|---|
 | GPT-SoVITS | `runtimes/gpt-sovits/` | `runtime/python.exe` 與相容依賴、固定版本的 `GPT_SoVITS/` 及配套模型，包含 v2Pro 聲碼器、s1v3、中文語音與文字編碼器、說話者嵌入模型。 |
 | CosyVoice 3 | `runtimes/cosyvoice3/` | `runtime/python.exe` 與相容依賴、固定版本的 `cosyvoice/`、`third_party/Matcha-TTS/`，以及 `pretrained_models/Fun-CosyVoice3-0.5B/` 下的完整 Fun-CosyVoice3-0.5B-2512 模型與配套資源。 |
+| VoxCPM2 | `runtimes/voxcpm2/` | `runtime/python.exe`、固定版本的 `src/voxcpm/`，以及 `pretrained_models/VoxCPM2/` 下的設定、tokenizer、主模型和 AudioVAE。 |
+| IndexTTS-2 | `runtimes/indextts2/` | `runtime/python.exe`、`indextts/`、`checkpoints/` 下的主模型及情緒權重。輔助模型使用 `checkpoints/hf_cache/`，保留完整快照及 refs。封包前將快照中的 Blob 連結實體化為檔案。 |
+| Qwen3-TTS | `runtimes/qwen3-tts/` | `runtime/python.exe`、`qwen_tts/`、`pretrained_models/Qwen3-TTS-12Hz-1.7B-Base/`、`-CustomVoice/` 或 `-VoiceDesign/`。可只放所需型號，每個型號需附自己的 speech tokenizer。 |
+
+在「聲音庫」建立角色，可共用參考錄音、錄音語言及逐字稿。合成頁可以覆寫這一次的逐字稿。歷史記錄保存提交時的角色名稱、模型及取樣率，也可選兩筆並排試聽。移除角色會保留原錄音及已生成的 WAV。
+
+VoxCPM2、IndexTTS-2 及 Qwen3-TTS 已完成介接替身測試。請依鎖定的上游版本備齊執行環境與模型，並在實機確認生成及離線能力。[上游版本](../engines/README.md)
 
 專案的 [engines/](../engines/README.md) 存放固定版本原始碼。啟動器內置網頁及介接程式。主程式與語音模型分開派發。工作資料寫到啟動器旁邊的 `config/`、`voices/`、`outputs/`、`cache/` 和 `logs/`。執行記錄以作業編號命名。可用的 Windows 顯示卡驅動及每個引擎需要的依賴由對應執行環境提供。
 

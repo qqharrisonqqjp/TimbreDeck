@@ -6,11 +6,11 @@ const catalog = {
     "CosyVoice 3",
     "以同一段錄音進行聲音複製、跨語言朗讀或指令朗讀。",
   ],
-  voxcpm2: ["VoxCPM2", "規劃支援錄音複製及文字聲線設計。"],
-  indextts2: ["IndexTTS-2", "規劃支援獨立的角色音色與情緒示範。"],
+  voxcpm2: ["VoxCPM2", "錄音複製、錄音延續與文字聲線設計。"],
+  indextts2: ["IndexTTS-2", "分開選擇角色音色與情緒示範。"],
   "qwen3-tts": [
     "Qwen3-TTS",
-    "規劃支援錄音複製、預設聲線及文字聲線設計。",
+    "以 Base、CustomVoice 或 VoiceDesign 選擇聲線。",
   ],
 };
 const integrated = (k) => Boolean(engines[k]?.modes?.length);
@@ -20,10 +20,23 @@ const lang = {
   en: "英語",
   ja: "日語",
   ko: "韓語",
+  de: "德語",
+  fr: "法語",
+  ru: "俄語",
+  pt: "葡萄牙語",
+  es: "西班牙語",
+  it: "意大利語",
   auto: "自動辨識",
 };
+const referenceLanguages = Object.fromEntries(
+  ["yue", "zh", "en", "ja", "ko", "auto"].map((id) => [id, lang[id]]),
+);
+const emotions = ["喜悅", "憤怒", "悲傷", "恐懼", "厭惡", "憂鬱", "驚訝", "平靜"];
 let draft,
   engines,
+  voices = [],
+  editingVoice = null,
+  historySelection = new Set(),
   currentJob,
   timer,
   writes = Promise.resolve(),
@@ -83,11 +96,16 @@ function d() {
   return (draft.drafts[draft.engine] ||= {});
 }
 function selectedMode(engine, id) {
-  return engine.modes.find((mode) => mode.id === id) ?? engine.modes[0];
+  return engine.modes.find((mode) => mode.id === id) ??
+    engine.modes.find((mode) => engine.availableVariants?.includes(mode.variant)) ??
+    engine.modes[0];
+}
+function canRun(engine, mode) {
+  return engine.ready && (!mode.variant || engine.availableVariants?.includes(mode.variant));
 }
 function panel() {
   const v = d().tab;
-  return ["models", "history"].includes(v)
+  return ["models", "history", "voices"].includes(v)
     ? v
     : integrated(draft.engine)
       ? "synth"
@@ -138,6 +156,33 @@ function setTab(k) {
   persist();
   render();
 }
+function selectedVoice() {
+  return voices.find((voice) => voice.id === draft.voiceId);
+}
+function useVoice(voice) {
+  draft.voiceId = voice.id;
+  draft.reference = voice.reference;
+  draft.referenceName = voice.name;
+}
+function referenceTranscript(settings) {
+  const voice = selectedVoice();
+  const belongsToReference = settings.transcriptFor === draft.reference;
+  if (voice) {
+    return belongsToReference && settings.transcriptVoice === voice.id
+      ? settings.transcript
+      : voice.transcript;
+  }
+  return (!settings.transcriptFor || belongsToReference) ? settings.transcript : "";
+}
+function replaceReference(reference, name) {
+  for (const settings of Object.values(draft.drafts)) {
+    if (!settings.transcriptFor && settings.transcript)
+      settings.transcriptFor = draft.reference || "";
+  }
+  draft.reference = reference;
+  draft.referenceName = name;
+  delete draft.voiceId;
+}
 function render() {
   renderID++;
   const k = draft.engine;
@@ -161,6 +206,7 @@ function render() {
   const tabs = {
     ...(integrated(k) ? { synth: "語音合成" } : {}),
     models: "模型管理",
+    voices: "聲音庫",
     history: "輸出歷史",
   };
   $("tabs").replaceChildren(
@@ -172,6 +218,7 @@ function render() {
   );
   if (panel() === "synth") synthesis();
   else if (panel() === "models") models();
+  else if (panel() === "voices") voiceLibrary();
   else history();
   showJob();
 }
@@ -228,8 +275,7 @@ function synthesis() {
       if (!file) return;
       try {
         const res = await api("reference", "POST", file);
-        draft.reference = res.id;
-        draft.referenceName = file.name;
+        replaceReference(res.id, file.name);
         persist();
         render();
       } catch (err) {
@@ -237,10 +283,21 @@ function synthesis() {
       }
     },
   });
-  const right = [
-    box("row", field("工作模式", modeCtrl), field("語速", speed)),
-  ];
+  const right = [box("row", field("工作模式", modeCtrl), ...(engine.speed ? [field("語速", speed)] : []))];
   if (mode.reference) {
+    if (voices.length)
+      right.push(field("角色", select(
+        { "": "單次錄音", ...Object.fromEntries(voices.map((voice) => [voice.id, voice.name])) },
+        draft.voiceId || "",
+        (value) => {
+          const voice = voices.find((item) => item.id === value);
+          if (voice) useVoice(voice);
+          else replaceReference("", "");
+          persist();
+          render();
+        },
+        "voice",
+      )));
     right.push(field("參考錄音（WAV）", el("span", { className: "filebtn" }, ref)));
     if (engine.minReference)
       right.push(hint(`使用 ${engine.minReference} 至 ${engine.maxReference} 秒的單人錄音。`));
@@ -262,87 +319,242 @@ function synthesis() {
         "參考錄音原本說了甚麼？",
         area(
           "transcript",
-          settings.transcript || "",
+          referenceTranscript(settings) || "",
           "填寫錄音中的實際對白",
-          (v) => update("transcript", v),
+          (v) => {
+            settings.transcriptFor = draft.reference;
+            settings.transcriptVoice = draft.voiceId || "";
+            update("transcript", v);
+          },
         ),
       ),
     );
-  if (mode.instruction)
+  if (mode.instruction || mode.style)
     right.push(
       field(
-        "講法指示",
+        mode.id === "design" ? "聲線描述" : mode.emotion === "text" ? "情緒描述" : "講法指示",
         area(
           "instruction",
-          settings.instruction || "",
+          settings.instructions?.[mode.id] ?? settings.instruction ?? "",
           "例如：請用廣東話，節奏稍慢，像跟朋友聊天。",
-          (v) => update("instruction", v),
+          (v) => {
+            settings.instructions ||= {};
+            settings.instructions[mode.id] = v;
+            changed();
+          },
         ),
       ),
     );
-  if (mode.languages)
+  if (mode.speaker)
+    right.push(field("預設聲線", select(
+      Object.fromEntries(engine.speakers.map((name) => [name, name])),
+      settings.speaker || engine.speakers[0], (value) => update("speaker", value), "speaker",
+    )));
+  if (mode.emotion) right.push(...emotionFields(mode.emotion, settings, update));
+  if (mode.languages) {
+    const options = Object.fromEntries(engine.languageOptions.map((id) => [id, lang[id]]));
     right.push(
       box(
         "row",
         field(
           "台詞語言",
           select(
-            lang,
-            settings.language || "yue",
+            options,
+            options[settings.language] ? settings.language : engine.languageOptions[0],
             (v) => update("language", v),
             "language",
           ),
         ),
-        field(
+        ...(k === "gpt-sovits" ? [field(
           "錄音語言",
           select(
-            lang,
-            settings.refLang || "yue",
-            (v) => update("refLang", v),
+            referenceLanguages,
+            (settings.refLangFor === draft.reference ? settings.refLang : selectedVoice()?.language) ||
+              settings.refLang || "yue",
+            (v) => {
+              settings.refLangFor = draft.reference;
+              update("refLang", v);
+            },
             "refLang",
           ),
-        ),
+        )] : []),
       ),
     );
+  }
   const controls = box(
     "actions",
     btn("試讀第一句", () => submit(true), { className: "run" }),
     btn("生成全文", () => submit(false), { className: "primary run" }),
   );
   const left = card("朗讀台詞", field("要讀出的文字", script), controls);
-  if (!engines[k].ready)
+  if (!canRun(engine, mode))
     left.append(
       box(
         "actions",
-        hint("合成前請先連接引擎。"),
+        hint(mode.variant ? "合成前請先安裝 " + mode.variant + " 模型。" : "合成前請先連接引擎。"),
         btn("前往模型管理", () => setTab("models")),
       ),
     );
-  $("work").replaceChildren(box("grid", left, card(engine.variants.join(" · "), ...right)));
+  $("work").replaceChildren(box("grid", left, card(mode.variant || engine.variants.join(" · "), ...right)));
+}
+function emotionFields(kind, settings, update) {
+  const fields = [];
+  if (kind === "audio") {
+    const input = el("input", {
+      type: "file", accept: ".wav,audio/wav", id: "emotion-reference",
+      onchange: async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        try {
+          const ref = await api("reference", "POST", file);
+          update("emotionReference", ref.id);
+          update("emotionName", file.name);
+          render();
+        } catch (err) { notice(err); }
+      },
+    });
+    fields.push(field("情緒參考錄音（WAV，最多 15 秒）", input));
+    if (settings.emotionReference) fields.push(
+      hint(settings.emotionName || "已匯入情緒錄音"),
+      el("audio", { controls: true, preload: "none", src: "/api/reference/" + settings.emotionReference }),
+    );
+  }
+  if (kind === "vector") {
+    const weights = settings.emotionWeights || Array(8).fill(0);
+    fields.push(box("grid", ...emotions.map((name, index) => field(name, el("input", {
+      type: "number", step: "0.05", min: 0, max: 1, value: weights[index],
+      onchange: (event) => {
+        weights[index] = event.target.valueAsNumber || 0;
+        update("emotionWeights", weights);
+      },
+    })))));
+  }
+  fields.push(field("情緒強度（0 至 1）", el("input", {
+    type: "number", step: "0.05", min: 0, max: 1, value: settings.emotionStrength ?? 1,
+    onchange: (event) => update("emotionStrength", event.target.valueAsNumber || 0),
+  })));
+  return fields;
 }
 async function submit(preview) {
   const k = draft.engine,
     s = d();
+  const engine = engines[k];
+  const mode = selectedMode(engine, s.mode);
   const payload = {
     engine: k,
-    mode: selectedMode(engines[k], s.mode).id,
+    mode: mode.id,
     text: draft.text || "",
-    transcript: s.transcript || "",
-    instruction: s.instruction || "",
-    reference: draft.reference || "",
-    language: s.language || "yue",
-    refLang: s.refLang || "yue",
-    speed: s.speed || 1,
+    transcript: mode.transcript ? referenceTranscript(s) || "" : "",
+    instruction: mode.instruction || mode.style ? s.instructions?.[mode.id] ?? s.instruction ?? "" : "",
+    reference: mode.reference ? draft.reference || "" : "",
+    voiceId: mode.reference ? draft.voiceId || "" : "",
+    language: engine.languageOptions?.includes(s.language) ? s.language : engine.languageOptions?.[0] || "yue",
+    refLang: (s.refLangFor === draft.reference ? s.refLang : selectedVoice()?.language) ||
+      s.refLang || "yue",
+    speed: engine.speed ? s.speed || 1 : 1,
     preview,
   };
+  if (mode.variant) payload.variant = mode.variant;
+  if (mode.speaker) payload.speaker = s.speaker || engine.speakers[0];
+  if (mode.emotion) payload.emotionStrength = s.emotionStrength ?? 1;
+  if (mode.emotion === "audio") payload.emotionReference = s.emotionReference || "";
+  if (mode.emotion === "vector") payload.emotionWeights = s.emotionWeights || Array(8).fill(0);
   persist();
   currentJob = await api("synthesize", "POST", payload);
   showJob();
+}
+function voiceLibrary() {
+  const list = card(
+    "角色",
+    btn("新增角色", () => {
+      editingVoice = {
+        name: "",
+        reference: draft.reference || "",
+        transcript: referenceTranscript(d()) || "",
+        language: selectedVoice()?.language || d().refLang || "yue",
+      };
+      render();
+    }, { className: "primary" }),
+  );
+  for (const voice of voices) {
+    list.append(box(
+      "stack",
+      el("h3", {}, voice.name),
+      el("audio", { controls: true, preload: "none", src: "/api/reference/" + voice.reference }),
+      box("actions",
+        btn("使用", () => {
+          useVoice(voice);
+          setTab("synth");
+        }),
+        btn("編輯", () => { editingVoice = { ...voice }; render(); }),
+      ),
+    ));
+  }
+  if (!editingVoice) {
+    $("work").replaceChildren(list);
+    return;
+  }
+  const voice = editingVoice;
+  const upload = el("input", {
+    type: "file", accept: ".wav,audio/wav",
+    onchange: async (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      try {
+        const ref = await api("reference", "POST", file);
+        if (ref.id !== voice.reference) voice.transcript = "";
+        voice.reference = ref.id;
+        if (editingVoice === voice && panel() === "voices") render();
+      } catch (err) { notice(err); }
+    },
+  });
+  const edit = card(
+    voice.id ? "編輯角色" : "新增角色",
+    field("名稱", el("input", {
+      type: "text", value: voice.name, maxLength: 80,
+      oninput: (event) => { voice.name = event.target.value; },
+    })),
+    field("參考錄音（WAV）", el("span", { className: "filebtn" }, upload)),
+    ...(voice.reference ? [el("audio", {
+      controls: true, preload: "metadata", src: "/api/reference/" + voice.reference,
+    })] : []),
+    field("錄音語言", select(referenceLanguages, voice.language, (value) => { voice.language = value; }, "voice-language")),
+    field("參考逐字稿", area("voice-transcript", voice.transcript, "填寫錄音中的實際對白",
+      (value) => { voice.transcript = value; })),
+    box("actions",
+      btn("儲存角色", async () => {
+        const saved = await api(voice.id ? "profiles/" + voice.id : "profiles", voice.id ? "PUT" : "POST", voice);
+        voices = await api("profiles");
+        if (draft.voiceId === saved.id) {
+          useVoice(saved);
+          persist();
+        }
+        editingVoice = null;
+        render();
+        notice("角色已儲存。");
+      }, { className: "primary" }),
+      btn("取消", () => { editingVoice = null; render(); }),
+    ),
+  );
+  if (voice.id) edit.append(btn("移除角色", async () => {
+    if (!window.confirm("移除「" + voice.name + "」？已儲存錄音和歷史仍可使用。")) return;
+    await api("profiles/" + voice.id, "DELETE");
+    voices = voices.filter((item) => item.id !== voice.id);
+    if (draft.voiceId === voice.id) {
+      delete draft.voiceId;
+      persist();
+    }
+    editingVoice = null;
+    render();
+  }));
+  $("work").replaceChildren(box("grid", list, edit));
 }
 function models() {
   const k = draft.engine;
   const root = engines[k].path;
   const about = card("模型", el("h3", {}, engines[k].variants.join(" · ")));
+  if (engines[k].availableVariants?.length)
+    about.append(hint("已找到模型：" + engines[k].availableVariants.join("、")));
   if (!integrated(k)) {
     about.append(hint("本預覽版尚未接通這款引擎。"));
     $("work").replaceChildren(about);
@@ -471,8 +683,9 @@ async function history() {
           new Date(x.created).toLocaleString("zh-HK") +
             "　" +
             x.seconds.toFixed(1) +
-            " 秒",
+            " 秒" + (x.sampleRate ? "　" + x.sampleRate + " Hz" : ""),
         ),
+        hint([x.voiceName, x.model || x.input.variant, x.packVersion].filter(Boolean).join(" · ") || "預覽版記錄"),
         el("p", { className: "history-text" }, x.input.text),
         box(
           "history-actions",
@@ -490,12 +703,23 @@ async function history() {
             },
             "匯出 WAV",
           ),
+          btn(historySelection.has(x.id) ? "取消比較" : "加入比較", () => {
+            if (historySelection.has(x.id)) historySelection.delete(x.id);
+            else {
+              if (historySelection.size >= 2) throw Error("請先取消其中一筆比較。");
+              historySelection.add(x.id);
+            }
+            history();
+          }),
         ),
       ),
     );
     $("work").replaceChildren(
+      ...(historySelection.size ? [
+        box("grid", ...content.filter((_, i) => historySelection.has(files[i].id))),
+      ] : []),
       ...(content.length
-        ? content
+        ? content.filter((_, i) => !historySelection.has(files[i].id))
         : [card("輸出歷史", hint("完成合成後，可在這裏試聽和匯出音檔。"))]),
     );
   } catch (e) {
@@ -506,7 +730,8 @@ function showJob() {
   const j = currentJob,
     busy = j && ["running", "cancelling"].includes(j.status);
   document.querySelectorAll(".run").forEach((b) => {
-    b.disabled = !!busy || !engines[draft.engine]?.ready;
+    const engine = engines[draft.engine];
+    b.disabled = !!busy || !canRun(engine, selectedMode(engine, d().mode));
   });
   const panel = $("job");
   if (!j) {
@@ -563,9 +788,11 @@ async function poll() {
 }
 (async () => {
   try {
-    const state = await api("state");
+    const [state, profiles] = await Promise.all([api("state"), api("profiles")]);
     draft = state.draft;
     engines = state.engines;
+    voices = profiles;
+    if (draft.voiceId && !selectedVoice()) delete draft.voiceId;
     draft.drafts ||= {};
     if (!catalog[draft.engine]) draft.engine = "gpt-sovits";
     for (const [k, v] of Object.entries(catalog))
