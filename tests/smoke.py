@@ -57,7 +57,7 @@ class TTS:
         assert args["text"] == "第一句。" and args["text_lang"] == "yue"
         assert args["prompt_text"] == "參考。" and args["speed_factor"] in (1, 1.25)
         self.vits_model.decode()
-        yield 24000, bytes([1, 0]) * 2400
+        yield 24000, bytes([1, 0, 2, 0]) * 1200
 """
 COSY = DEVICE_FIXTURE + """
 class Audio:
@@ -173,6 +173,28 @@ def check_execution(root, key, engine, mode):
     file(path, json.dumps(details))
 
 
+def check_acceptance(binary, root, reference):
+    ref_path = root / "reference.wav"
+    ref_path.write_bytes(reference)
+    for strict in (False, True):
+        target = root / ("cuda-acceptance" if strict else "cpu-acceptance")
+        command = [
+            sys.executable, str(Path(__file__).with_name("acceptance.py")),
+            str(binary.resolve()), str(ref_path), "參考。", str(target),
+            "--gpt", str(root / "runtimes" / "gpt-sovits"),
+            "--text", "第一句。", "--timeout", "20",
+        ]
+        if strict:
+            command.append("--require-cuda")
+        run = subprocess.run(command, capture_output=True, timeout=30)
+        assert run.returncode == int(strict), (run.stdout, run.stderr)
+        report = json.loads((target / "comparison.json").read_text(encoding="utf-8"))
+        gpt = report["engines"]["gpt-sovits"]
+        assert gpt["status"] == "generated" and gpt["execution"]["job"] == gpt["job"]
+        assert gpt.get("cuda_status") == ("failed" if strict else None), gpt
+        assert (target / "gpt-sovits.wav").is_file()
+
+
 def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("binary", type=Path)
@@ -251,7 +273,8 @@ def main():
         finally:
             runtime.terminate()
             runtime.wait(timeout=15)
-    print("Launcher HTTP, four adapter contracts, history and WAV export passed.")
+        check_acceptance(args.binary, root, wav.getvalue())
+    print("Launcher HTTP, four adapter contracts, history, WAV export and CUDA acceptance checks passed.")
 
 
 if __name__ == "__main__":
