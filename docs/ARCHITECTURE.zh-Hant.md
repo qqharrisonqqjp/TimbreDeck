@@ -55,6 +55,8 @@
 | 4　逐款擴充 | 依第二款引擎的實測封裝 CosyVoice。把前兩款已知能力集中到目錄，再逐款接入 VoxCPM2、IndexTTS-2、Qwen3-TTS。每次只加入當款需要的模式、模型選擇與輸入 | 每款均有對應模式的契約測試、真實生成樣本、離線重開測試。切回前一款仍可讀既有草稿、素材及歷史 |
 | 5　角色與訓練 | 增加角色資料及 GPT-SoVITS 訓練流程，串接匯入、切片、校對、微調、對照試聽及儲存角色 | 可中途關閉後恢復已保存的階段，用未參與訓練的同一句台詞比較原版與微調版，並重新選回原版 |
 
-**第一個編程任務到步驟 1 為止。** Sol 6.2 從 PR #1 的開發線接手，先讀 studio/worker.py、tests/acceptance.py 和 tests/smoke.py。交付驗收工具、回歸測試及 docs/PREVIEW.md 的執行示例。Windows GPU、完整的兩款 Windows 引擎環境、原參考錄音及逐字稿是步驟 2 的輸入。每次交接分列「工具測試」、「實機生成」、「人工試聽」與「包安裝」，並附對應結果的位置。
+**第一個可獨立審查的改動是步驟 1；完成後按依賴接續後面的工作。** Sol 6.2 從 PR #1 的開發線接手，先讀 studio/worker.py、tests/acceptance.py 和 tests/smoke.py。交付驗收工具、回歸測試及 docs/PREVIEW.md 的執行示例。Windows GPU、完整的兩款 Windows 引擎環境、原參考錄音及逐字稿是步驟 2 的輸入。每次交接分列「工具測試」、「實機生成」、「人工試聽」與「包安裝」，並附對應結果的位置。
 
 現有資料：[產品規格](PLAN.zh-Hant.md) · [預覽版、驗收及封裝指令](PREVIEW.md) · [引擎版本及授權](../engines/README.md) · [PR #1](https://github.com/qqharrisonqqjp/TimbreDeck/pull/1)
+
+完整的實作次序、介面契約、驗收表及新對話開工指令見[開發交接手冊](SOL-HANDOFF.zh-Hant.md)。
