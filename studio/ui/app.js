@@ -713,6 +713,19 @@ function trainingClipFields(project, clip, index) {
     ),
   );
 }
+const upstreamEngineLinks = {
+  "gpt-sovits": "https://huggingface.co/lj1995/GPT-SoVITS-windows-package/tree/main",
+  cosyvoice3: "https://github.com/FunAudioLLM/CosyVoice",
+  voxcpm2: "https://github.com/OpenBMB/VoxCPM",
+  indextts2: "https://github.com/index-tts/index-tts",
+  "qwen3-tts": "https://github.com/QwenLM/Qwen3-TTS",
+};
+const upstreamModelLinks = {
+  "gpt-sovits": "https://huggingface.co/lj1995/GPT-SoVITS",
+  cosyvoice3: "https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+  voxcpm2: "https://huggingface.co/openbmb/VoxCPM2",
+  indextts2: "https://huggingface.co/IndexTeam/IndexTTS-2",
+};
 function downloadControl(engine, kind, label, variant = "") {
   const suffix = new URLSearchParams({ kind, variant }).toString();
   const route = engine + "?" + suffix;
@@ -723,7 +736,7 @@ function downloadControl(engine, kind, label, variant = "") {
     try {
       const p = await api("pack/" + route);
       info.replaceChildren(
-        hint(p.version + "　下載 " + gb(p.bytes) + "　安裝後 " + gb(p.expanded)
+        hint(p.source + " · " + p.version + "　下載 " + gb(p.bytes) + "　安裝後 " + gb(p.expanded)
           + "　可用空間 " + gb(p.free)),
         btn("確認下載並安裝", async () => {
           currentJob = await api("install/" + route, "POST", { hash: p.hash });
@@ -732,6 +745,19 @@ function downloadControl(engine, kind, label, variant = "") {
       );
     } catch (err) {
       info.textContent = err.message;
+      if (kind === "runtime" && upstreamEngineLinks[engine]) {
+        info.append(el("a", {
+          className: "linkbtn", href: upstreamEngineLinks[engine], target: "_blank", rel: "noopener noreferrer",
+        }, engine === "gpt-sovits" ? "開啟官方 Windows 下載頁" : "查看上游安裝說明"));
+      }
+      if (kind === "model") {
+        const href = engine === "qwen3-tts"
+          ? "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-" + variant
+          : upstreamModelLinks[engine];
+        if (href) info.append(el("a", {
+          className: "linkbtn", href, target: "_blank", rel: "noopener noreferrer",
+        }, "開啟官方模型頁"));
+      }
     }
   };
   return box("stack", box("actions", btn(label, lookup)), info);
@@ -796,7 +822,8 @@ function models() {
     installed.then((items) => {
         files.replaceChildren(...items.filter((item) => item.variant === variant).map((item) =>
           box("stack",
-            hint((item.version || item.id) + (item.source === "bundle" ? " · 原整合包" : "")),
+            hint([item.version || item.id, item.provider, item.source === "bundle" ? "原整合包" : ""]
+              .filter(Boolean).join(" · ")),
             box("actions", btn("刪除模型", async () => {
               if (!window.confirm("刪除 " + variant + " 模型權重？錄音及生成紀錄會保留。")) return;
               await api("installed-models/" + k + "/" + encodeURIComponent(variant) + "/" + item.id

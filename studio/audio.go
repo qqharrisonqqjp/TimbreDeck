@@ -401,6 +401,8 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 	var pack manifest
 	if readJSON(filepath.Join(modelRoot, packMetadata), &pack) == nil && pack.check(q.Engine) == nil {
 		record.PackVersion = pack.Version
+	} else if model, owned := s.ownedUpstream(modelRoot, q.Engine, q.Variant, filepath.Base(modelRoot)); owned {
+		record.PackVersion = model.Version
 	}
 	if splitRoot != "" {
 		var runtimePack manifest

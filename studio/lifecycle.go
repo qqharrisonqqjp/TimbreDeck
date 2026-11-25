@@ -11,11 +11,12 @@ import (
 )
 
 type modelAsset struct {
-	ID      string `json:"id"`
-	Variant string `json:"variant"`
-	Version string `json:"version"`
-	Source  string `json:"source"`
-	Path    string `json:"path"`
+	ID       string `json:"id"`
+	Variant  string `json:"variant"`
+	Version  string `json:"version"`
+	Source   string `json:"source"`
+	Path     string `json:"path"`
+	Provider string `json:"provider,omitempty"`
 }
 
 func (s *studio) managedPath(path string) bool {
@@ -88,15 +89,25 @@ func (s *studio) installedModels(w http.ResponseWriter, r *http.Request) {
 		for _, entry := range roots {
 			for _, id := range packFolders(entry.path) {
 				root := filepath.Join(entry.path, id)
-				p, owned := s.ownedPack(root, engine, id)
+				version, provider, _, owned := s.modelOwnership(root, engine, variant, id, entry.source)
 				path := filepath.Join(root, modelFolder(engine, variant))
 				if info, err := os.Lstat(path); owned && err == nil && info.IsDir() && s.managedPath(path) {
-					items = append(items, modelAsset{ID: id, Variant: variant, Version: p.Version, Source: entry.source, Path: root})
+					items = append(items, modelAsset{ID: id, Variant: variant, Version: version, Source: entry.source, Path: root, Provider: provider})
 				}
 			}
 		}
 	}
 	send(w, 200, items)
+}
+
+func (s *studio) modelOwnership(root, engine, variant, key, source string) (string, string, any, bool) {
+	if source == "model" {
+		if model, owned := s.ownedUpstream(root, engine, variant, key); owned {
+			return model.Version, "Hugging Face", model, true
+		}
+	}
+	p, owned := s.ownedPack(root, engine, key)
+	return p.Version, "", p, owned
 }
 
 func (s *studio) beginRemoval(w http.ResponseWriter) bool {
@@ -289,13 +300,13 @@ func (s *studio) removeOfficialModel(w http.ResponseWriter, r *http.Request) {
 		root = s.path("runtimes", engine, key)
 		selected = filepath.Join(root, modelFolder(engine, variant))
 	}
-	p, managed := s.ownedPack(root, engine, key)
+	version, _, metadata, managed := s.modelOwnership(root, engine, variant, key, source)
 	if !managed || !s.managedPath(selected) {
 		fail(w, 404, "找不到由聲台安裝的模型。")
 		return
 	}
 	if err := removeResources([]string{selected}, func() error {
-		return s.removalRecord("model", engine, variant, p.Version, key, p)
+		return s.removalRecord("model", engine, variant, version, key, metadata)
 	}); err != nil {
 		fail(w, 500, err.Error())
 		return

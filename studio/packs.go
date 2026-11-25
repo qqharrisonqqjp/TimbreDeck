@@ -20,6 +20,8 @@ import (
 
 const packURL = "https://github.com/qqharrisonqqjp/TimbreDeck/releases/download/"
 
+var errPackUnavailable = errors.New("此項目暫未有可下載版本。已有本機安裝包時可以離線匯入。")
+
 var assetName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$`)
 var installedPackName = regexp.MustCompile(`^pack-[a-f0-9]{16}(-[a-f0-9]{8})?$`)
 
@@ -95,7 +97,7 @@ func fetchManifest(ctx context.Context, engine, kind, variant string) (manifest,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 404 {
-		return p, errors.New("此項目暫未有可下載版本。已有本機安裝包時可以離線匯入。")
+		return p, errPackUnavailable
 	}
 	if resp.StatusCode != 200 {
 		return p, fmt.Errorf("讀取發佈清單失敗（HTTP %d）。", resp.StatusCode)
@@ -121,8 +123,36 @@ func readManifest(r io.Reader, engine string) (manifest, error) {
 	}
 	return p, p.check(engine)
 }
+
+type downloadOffer struct {
+	Version  string
+	Hash     string
+	Bytes    int64
+	Expanded int64
+	Source   string
+	install  func(context.Context) error
+}
+
+func (s *studio) downloadOffer(r *http.Request) (downloadOffer, error) {
+	engine, kind, variant := r.PathValue("engine"), r.URL.Query().Get("kind"), r.URL.Query().Get("variant")
+	p, err := fetchManifest(r.Context(), engine, kind, variant)
+	if kind == "model" && errors.Is(err, errPackUnavailable) {
+		plan, err := fetchUpstreamPlan(r.Context(), engine, variant)
+		if err != nil {
+			return downloadOffer{}, err
+		}
+		return downloadOffer{plan.Version, plan.Hash, plan.Bytes, plan.Bytes, "Hugging Face 官方模型",
+			func(ctx context.Context) error { return s.installUpstreamModel(ctx, plan) }}, nil
+	}
+	if err != nil {
+		return downloadOffer{}, err
+	}
+	return downloadOffer{p.Version, p.Hash, p.size(), p.Expanded, "TimbreDeck Releases",
+		func(ctx context.Context) error { return s.installPack(ctx, p, packURL+"packs-v1/") }}, nil
+}
+
 func (s *studio) packInfo(w http.ResponseWriter, r *http.Request) {
-	p, e := fetchManifest(r.Context(), r.PathValue("engine"), r.URL.Query().Get("kind"), r.URL.Query().Get("variant"))
+	p, e := s.downloadOffer(r)
 	if e != nil {
 		fail(w, 424, e.Error())
 		return
@@ -132,7 +162,8 @@ func (s *studio) packInfo(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, e.Error())
 		return
 	}
-	send(w, 200, map[string]any{"bytes": p.size(), "expanded": p.Expanded, "free": free, "hash": p.Hash, "version": p.Version})
+	send(w, 200, map[string]any{"bytes": p.Bytes, "expanded": p.Expanded, "free": free,
+		"hash": p.Hash, "version": p.Version, "source": p.Source})
 }
 func (s *studio) install(w http.ResponseWriter, r *http.Request) {
 	engine := r.PathValue("engine")
@@ -140,7 +171,7 @@ func (s *studio) install(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	p, e := fetchManifest(r.Context(), engine, r.URL.Query().Get("kind"), r.URL.Query().Get("variant"))
+	p, e := s.downloadOffer(r)
 	if e != nil {
 		fail(w, 424, e.Error())
 		return
@@ -154,7 +185,7 @@ func (s *studio) install(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, "已有作業進行中。")
 		return
 	}
-	go func() { s.finish(s.installPack(ctx, p, packURL+"packs-v1/")) }()
+	go func() { s.finish(p.install(ctx)) }()
 	send(w, 202, j)
 }
 
@@ -296,17 +327,23 @@ func (c checkingReader) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
 func downloadPart(ctx context.Context, url, path string, v part) error {
+	return downloadVerifiedFile(ctx, http.DefaultClient, url, path, v.Size, func() bool {
+		return verify(ctx, path, v.Hash)
+	})
+}
+
+func downloadVerifiedFile(ctx context.Context, client *http.Client, url, path string, size int64, valid func() bool) error {
 	var offset int64
 	if st, e := os.Stat(path); e == nil {
 		offset = st.Size()
 	}
-	if offset == v.Size && verify(ctx, path, v.Hash) {
+	if offset == size && valid() {
 		return nil
 	}
 	if e := ctx.Err(); e != nil {
 		return e
 	}
-	if offset >= v.Size {
+	if offset >= size {
 		offset = 0
 	}
 	req, e := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -316,7 +353,8 @@ func downloadPart(ctx context.Context, url, path string, v part) error {
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, e := http.DefaultClient.Do(req)
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, e := client.Do(req)
 	if e != nil {
 		return e
 	}
@@ -327,7 +365,7 @@ func downloadPart(ctx context.Context, url, path string, v part) error {
 		offset = 0
 		flags |= os.O_TRUNC
 	case 206:
-		if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", offset, v.Size-1, v.Size) {
+		if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", offset, size-1, size) {
 			return errors.New("分卷續傳範圍不符。")
 		}
 		flags |= os.O_APPEND
@@ -338,7 +376,7 @@ func downloadPart(ctx context.Context, url, path string, v part) error {
 	if e != nil {
 		return e
 	}
-	n, e := io.Copy(f, io.LimitReader(resp.Body, v.Size-offset+1))
+	n, e := io.Copy(f, io.LimitReader(resp.Body, size-offset+1))
 	closeErr := f.Close()
 	if e != nil {
 		return e
@@ -346,10 +384,10 @@ func downloadPart(ctx context.Context, url, path string, v part) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	if n != v.Size-offset {
+	if n != size-offset {
 		return errors.New("分卷下載不完整，可再次安裝以續傳。")
 	}
-	if !verify(ctx, path, v.Hash) {
+	if !valid() {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
