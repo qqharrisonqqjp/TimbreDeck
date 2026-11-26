@@ -55,29 +55,30 @@ def tool(action, description, properties=None, required=(), read_only=False):
     }
 
 
-PATH = string(4096, description="An explicitly selected WAV, absolute or relative to the configured input root.")
+PATH = string(4096, description="An explicitly selected recording (WAV, MP3, MP4, M4A, AAC or MOV) in the configured input root.")
 REFS = array(PATH, 1, 24)
 BOOL = {"type": "boolean"}
 TOOLS = [tool(*args, **kwargs) for args, kwargs in [
     (("capabilities", "Read local TimbreDeck engine and feature capabilities."), {"read_only": True}),
     (("status", "Read local TimbreDeck Studio status and any current job."), {"read_only": True}),
     (("asr", "Transcribe an explicitly selected local WAV; may import this WAV into the local Studio.",
-      {"reference": PATH, "language": enum(ASR_LANGUAGES)}, ("reference",)), {}),
+      {"reference": PATH, "language": enum(ASR_LANGUAGES),"asr_model":string(80,pattern=r"^[a-z0-9-]+$")}, ("reference",)), {}),
     (("synthesize", "Generate and export a new WAV with a configured local voice engine.",
-      {"engine": enum(ENGINES), "text": string(10000), "language": enum(SYNTH_LANGUAGES),
+      {"engine": string(80,pattern=r"^[a-z0-9-]+$"), "text": string(10000), "language": enum(SYNTH_LANGUAGES),
        "mode": string(48, pattern=r"^[A-Za-z0-9_-]+$"), "reference": PATH,
        "transcript": string(10000), "reference_language": enum(ASR_LANGUAGES), "voice_id": string(32, pattern=ID_PATTERN),
        "variant": string(48, pattern=r"^[A-Za-z0-9_-]+$"), "speaker": string(160),
        "instruction": string(2000), "speed": number(0.5, 2),
        "emotion_reference": PATH, "emotion_strength": number(0, 1),
        "emotion_weights": array(number(0, 1), 8, 8),
-       "model_project": string(32, pattern=ID_PATTERN), "preview": BOOL},
+       "model_project": string(32, pattern=ID_PATTERN), "preview": BOOL,"split_at":number(20,2000,"integer"),
+       "split_gap_ms":number(0,5000,"integer"),"separate_parts":BOOL,"asr_model":string(80,pattern=r"^[a-z0-9-]+$")},
       ("engine", "text")), {}),
     (("clean", "Denoise or isolate speech from the explicitly ordered WAVs, then export a new WAV.",
       {"references": REFS, "mode": enum(["denoise", "uvr", "both"]), "gap_ms": number(0, 3000, "integer")},
       ("references",)), {}),
     (("dataset", "Split and transcribe explicitly selected WAVs for a GPT-SoVITS dataset; export a new ZIP.",
-      {"references": REFS, "language": enum(LANGUAGES), "speaker": string(64), "denoise": BOOL},
+      {"references": REFS, "language": enum(LANGUAGES), "speaker": string(64), "denoise": BOOL,"asr_model":string(80,pattern=r"^[a-z0-9-]+$")},
       ("references", "language")), {}),
 ]]
 BY_NAME = {item["name"]: item for item in TOOLS}
@@ -133,8 +134,8 @@ def resolve_local_path(path, root):
 def local_wav(value, root):
     try:
         path = resolve_local_path(Path(value), root)
-        if path.suffix.lower() != ".wav" or not 44 <= path.stat().st_size <= MAX_WAV:
-            raise ValueError("WAV must be 44 bytes to 32 MiB")
+        if path.suffix.lower() not in {".wav",".mp3",".mp4",".m4a",".aac",".mov"} or not 12 <= path.stat().st_size <= MAX_WAV:
+            raise ValueError("Recording must be 12 bytes to 32 MiB")
     except (OSError, ValueError, RuntimeError) as exc:
         raise ValueError("Select a valid WAV inside the configured input root (max 32 MiB)") from exc
     return str(path)

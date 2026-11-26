@@ -125,19 +125,21 @@ def wav_header(header):
     return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE"
 
 
+INPUT_EXTENSIONS = {".wav", ".mp3", ".mp4", ".m4a", ".aac", ".mov"}
+
 def input_wavs(paths):
     if not 1 <= len(paths) <= MAX_FILES:
         raise AgentError("usage", f"Provide between 1 and {MAX_FILES} explicit WAV paths.")
     total, prepared = 0, []
     for filename in paths:
         path = explicit_path(filename)
-        if path.suffix.lower() != ".wav":
-            raise AgentError("invalid_wav", f"Expected a .wav file: {path}")
+        if path.suffix.lower() not in INPUT_EXTENSIONS:
+            raise AgentError("invalid_wav", f"Expected WAV, MP3, MP4, M4A, AAC or MOV: {path}")
         try:
             data = stable_file(path, min(MAX_INPUT - total, MAX_WAV))
         except FileNotFoundError as exc:
             raise AgentError("missing_input", f"WAV file does not exist: {path}") from exc
-        if not wav_header(data) or int.from_bytes(data[4:8], "little") + 8 != len(data):
+        if path.suffix.lower()==".wav" and (not wav_header(data) or int.from_bytes(data[4:8], "little") + 8 != len(data)):
             raise AgentError("invalid_wav", f"File does not contain one complete RIFF WAV: {path}")
         total += len(data)
         prepared.append(data)
@@ -303,17 +305,22 @@ class Client:
         response = self.json("POST", "/api/reference", data=data, expected=(201,))
         expected = hashlib.sha256(data).hexdigest()
         duration = response.get("seconds") if isinstance(response, dict) else None
-        if (not isinstance(response, dict) or response.get("id") != expected or
+        key = response.get("id") if isinstance(response, dict) else None
+        if (not isinstance(response, dict) or not isinstance(key,str) or not re.fullmatch("[a-f0-9]{64}",key) or
+                response.get("sourceSha256",key) != expected or
                 type(duration) not in (float, int) or not 0 < duration < 2**31):
             raise AgentError("invalid_response", "The service did not confirm the WAV's content hash and duration.")
-        return {"id": expected, "seconds": duration}
+        return {"id": key, "seconds": duration}
 
-    def recognize(self, reference, language):
-        value = self.json("POST", "/api/asr", {"reference": reference, "language": language})
+    def recognize(self, reference, language, model=None):
+        request={"reference":reference,"language":language}
+        if model:
+            request["model"]=model
+        value = self.json("POST", "/api/asr", request)
         if (not isinstance(value, dict) or not isinstance(value.get("text"), str)
                 or not isinstance(value.get("provider"), str) or not isinstance(value.get("language"), str)):
             raise AgentError("invalid_response", "The service returned an incomplete transcript.")
-        return {k: value[k] for k in ("text", "provider", "language", "requestedLanguage", "warning", "cached") if k in value}
+        return {k: value[k] for k in ("text", "provider", "language", "requestedLanguage", "warning", "cached","model") if k in value}
 
     def submit(self, path, payload):
         # An HTTP conflict after the idle check is a race with a user job,
@@ -356,8 +363,9 @@ def engine_capabilities(client):
     if not isinstance(engines, dict):
         raise AgentError("invalid_response", "The local service returned no engine capabilities.")
     result = {}
-    for key in ENGINE_IDS:
-        entry = engines.get(key)
+    for key, entry in engines.items():
+        if not isinstance(key,str) or not re.fullmatch(r"[a-z0-9-]{1,80}",key):
+            continue
         if not isinstance(entry, dict):
             continue
         fields = {f: entry[f] for f in ("ready", "engineInstalled", "variants", "availableVariants",
@@ -514,7 +522,7 @@ def synthesize(client, args):
     emotion_reference = client.upload(data[-1])["id"] if args.emotion_reference else None
     recognition = None
     if mode.get("transcript") and not transcript:
-        recognition = client.recognize(reference, reference_language)
+        recognition = client.recognize(reference, reference_language, args.asr_model)
         transcript = recognition["text"].strip()
         if not transcript:
             raise AgentError("empty_transcript", "No speech was recognized; supply an accurate --transcript or a clearer WAV.")
@@ -530,9 +538,14 @@ def synthesize(client, args):
                      ("emotionStrength", args.emotion_strength), ("emotionWeights", args.emotion_weights)):
         if value is not None:
             payload[k] = value
+    if args.split_at:
+        payload.update(splitAt=args.split_at,splitGapMs=args.split_gap_ms)
+    if args.separate_parts:
+        payload["splitSeparate"]=True
     job = client.submit("/api/synthesize", payload)
-    artifact = export(client, job, "/api/audio/" + job["id"], output_dir,
-                      f"tts-{args.engine}-{job['id']}.wav", "audio/wav", "synthesis")
+    artifact = export(client, job, "/api/audio/" + job["id"] + ("/parts" if args.separate_parts else ""), output_dir,
+                      f"tts-{args.engine}-{job['id']}."+("zip" if args.separate_parts else "wav"),
+                      "application/zip" if args.separate_parts else "audio/wav", "synthesis")
     result = {"job": job, "artifacts": [artifact]}
     if recognition is not None:
         result["recognition"] = recognition
@@ -564,6 +577,8 @@ def batch(client, args):
                           f"clean-{args.mode}-{job['id']}.wav", "audio/wav", "clean")
     else:
         payload.update(language=args.language, speaker=args.speaker, denoise=args.denoise)
+        if args.asr_model:
+            payload["asrModel"]=args.asr_model
         job = client.submit("/api/datasets/auto", payload)
         artifact = export(client, job, "/api/datasets/auto/" + job["id"] + "/download", output_dir,
                           f"dataset-{job['id']}.zip", "application/zip", "dataset")
@@ -615,13 +630,14 @@ def run(args):
         if args.action == "capabilities":
             out.update(engines=engine_capabilities(client), asrLanguages=list(ASR_LANGUAGES),
                        datasetLanguages=list(TRAINING_LANGUAGES), cleaningModes=["denoise", "uvr", "both"],
+                       inputFormats=sorted(x[1:] for x in INPUT_EXTENSIONS),
                        actions=["capabilities", "status", "asr", "synthesize", "dataset", "clean"])
         return out
     if args.action == "asr":
         data = input_wavs([args.reference])
         client.ensure_idle()
         reference = client.upload(data[0])
-        return {"reference": reference["id"], **client.recognize(reference["id"], args.language)}
+        return {"reference": reference["id"], **client.recognize(reference["id"], args.language,args.asr_model)}
     if args.action == "synthesize":
         return synthesize(client, args)
     return batch(client, args)
@@ -637,8 +653,9 @@ def create_parser():
     asr = sub.add_parser("asr", help="Transcribe an explicit WAV with local ASR.")
     asr.add_argument("--reference", required=True, help="Local WAV path.")
     asr.add_argument("--language", choices=ASR_LANGUAGES, default="auto")
+    asr.add_argument("--asr-model")
     tts = sub.add_parser("synthesize", help="Synthesize speech and export a new WAV.")
-    tts.add_argument("--engine", choices=ENGINE_IDS, required=True)
+    tts.add_argument("--engine", required=True, help="An engine ID from capabilities.")
     tts.add_argument("--mode", default="clone")
     tts.add_argument("--text", required=True)
     tts.add_argument("--language", default="auto")
@@ -656,6 +673,10 @@ def create_parser():
     tts.add_argument("--emotion-strength", type=float)
     tts.add_argument("--emotion-weights", type=float, nargs=8)
     tts.add_argument("--preview", action="store_true")
+    tts.add_argument("--split-at", type=int, default=0)
+    tts.add_argument("--split-gap-ms", type=int, default=150)
+    tts.add_argument("--separate-parts", action="store_true")
+    tts.add_argument("--asr-model")
     tts.add_argument("--output-dir")
     clean = sub.add_parser("clean", help="Clean and combine WAVs in the supplied order.")
     clean.add_argument("--reference", action="append", required=True, help="Local WAV path; repeat for each input in order.")
@@ -667,6 +688,7 @@ def create_parser():
     dataset.add_argument("--language", choices=TRAINING_LANGUAGES, required=True)
     dataset.add_argument("--speaker", "--name", dest="speaker", default="speaker-1")
     dataset.add_argument("--denoise", action="store_true")
+    dataset.add_argument("--asr-model")
     dataset.add_argument("--output-dir")
     return parser
 

@@ -49,11 +49,13 @@ type asrResult struct {
 	RequestedLanguage string `json:"requestedLanguage"`
 	Warning           string `json:"warning,omitempty"`
 	Cached            bool   `json:"cached"`
+	Model             string `json:"model,omitempty"`
 }
 
 type asrRequest struct {
 	Reference string `json:"reference"`
 	Language  string `json:"language"`
+	Model     string `json:"model,omitempty"`
 }
 
 type asrWorkerRequest struct {
@@ -61,6 +63,7 @@ type asrWorkerRequest struct {
 	Language string   `json:"language"`
 	Assets   string   `json:"assets"`
 	Output   string   `json:"output"`
+	Model    string   `json:"model,omitempty"`
 }
 
 func validASRLanguage(code string) bool {
@@ -101,7 +104,7 @@ func (s *studio) asrHandler(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnprocessableEntity, "錄音並非支援的 WAV 音檔。")
 		return
 	}
-	results, err := s.recognizeFiles(r.Context(), []string{path}, request.Language)
+	results, err := s.recognizeWithModel(r.Context(), []string{path}, request.Language, request.Model)
 	if err != nil {
 		status := http.StatusUnprocessableEntity
 		switch {
@@ -179,6 +182,9 @@ func (r asrContextReader) Read(p []byte) (int, error) {
 }
 
 func (s *studio) recognizeFiles(ctx context.Context, paths []string, language string) ([]asrResult, error) {
+	return s.recognizeWithModel(ctx, paths, language, "")
+}
+func (s *studio) recognizeWithModel(ctx context.Context, paths []string, language, chosen string) ([]asrResult, error) {
 	if !validASRLanguage(language) || len(paths) == 0 || len(paths) > asrBatchLimit {
 		return nil, errors.New("辨識音檔數量或語言不正確。")
 	}
@@ -203,6 +209,16 @@ func (s *studio) recognizeFiles(ctx context.Context, paths []string, language st
 	if err != nil {
 		return nil, err
 	}
+	if chosen != "" && !asrModelAvailable(models, chosen) {
+		return nil, errors.New("所選 ASR 模型未安裝或仍未整合。")
+	}
+	runtime := engine
+	if strings.HasPrefix(chosen, "qwen3-asr-") {
+		runtime = s.qwenASRRuntime()
+		if runtime == "" {
+			return nil, errors.New("Qwen3-ASR 需要已連接嘅 Qwen Python 3.11 runtime。")
+		}
+	}
 	if !s.managedPath(s.path("cache")) {
 		return nil, errors.New("語音辨識暫存資料夾無效。")
 	}
@@ -217,7 +233,15 @@ func (s *studio) recognizeFiles(ctx context.Context, paths []string, language st
 	var clips []string
 	var totalSeconds float64
 	var totalBytes int64
-	version := s.asrCacheVersion(engine, models, language)
+	version := s.asrCacheVersion(runtime, models, language)
+	version = append(version, []byte("\x00"+chosen)...)
+	if chosen != "" {
+		for _, f := range []string{"model.bin", "tokenizer.json", "config.json", "timbredeck-asr.json"} {
+			if st, e := os.Stat(filepath.Join(models, chosen, f)); e == nil {
+				version = fmt.Appendf(version, "/%s:%d:%d", f, st.Size(), st.ModTime().UnixNano())
+			}
+		}
+	}
 	for i, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -270,7 +294,13 @@ func (s *studio) recognizeFiles(ctx context.Context, paths []string, language st
 	if len(clips) == 0 {
 		return results, nil
 	}
-	got, err := runASR(ctx, work, engine, models, language, clips)
+	got, err := runASRModel(ctx, work, runtime, models, language, chosen, clips)
+	if err != nil && runtime != engine && ctx.Err() == nil {
+		got, err = runASRModel(ctx, work, engine, models, language, "faster-whisper-small", clips)
+		for i := range got {
+			got[i].Warning = "Qwen3-ASR 未能辨識，已用 Faster Whisper Small。" + got[i].Warning
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -325,12 +355,15 @@ func stageASR(ctx context.Context, path, staged string, expected int64, version 
 }
 
 func runASR(ctx context.Context, dir, engine, modelDir, language string, clips []string) ([]asrResult, error) {
+	return runASRModel(ctx, dir, engine, modelDir, language, "", clips)
+}
+func runASRModel(ctx context.Context, dir, engine, modelDir, language, chosen string, clips []string) ([]asrResult, error) {
 	python := filepath.Join(engine, "runtime", "python.exe")
 	script, output := filepath.Join(dir, "asr_worker.py"), filepath.Join(dir, "result.json")
 	if err := os.WriteFile(script, asrSource, 0600); err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(asrWorkerRequest{clips, language, modelDir, output})
+	payload, err := json.Marshal(asrWorkerRequest{Paths: clips, Language: language, Assets: modelDir, Output: output, Model: chosen})
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +401,7 @@ func runASR(ctx context.Context, dir, engine, modelDir, language string, clips [
 		return nil, errors.New("辨識結果無效。")
 	}
 	for i := range got {
-		if (got[i].Provider != "sensevoice" && got[i].Provider != "faster-whisper") || got[i].RequestedLanguage != language ||
+		if (got[i].Provider != "sensevoice" && got[i].Provider != "faster-whisper" && got[i].Provider != "qwen3-asr" && got[i].Provider != "fun-asr") || got[i].RequestedLanguage != language ||
 			len(got[i].Text) > 40000 || len(got[i].Warning) > 512 || !utf8.ValidString(got[i].Text) || got[i].Language == "" {
 			return nil, errors.New("辨識結果不完整。")
 		}

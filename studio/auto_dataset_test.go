@@ -112,7 +112,7 @@ func TestAutoDatasetZIPAndHistory(t *testing.T) {
 			{Text: "帶傘。", Provider: "fixture"},
 		}, nil
 	}
-	j := postAutoFixture(t, s, autoDatasetRequest{[]string{key1, key2}, "yue", "廣東話聲線", false},
+	j := postAutoFixture(t, s, autoDatasetRequest{References:[]string{key1, key2},Language:"yue",Speaker:"廣東話聲線"},
 		recognizer, nil)
 	awaitClean(t, h, j.ID, "done")
 	out := cleanCall(t, h, "GET", "/api/datasets/auto/"+j.ID+"/download", nil, 200)
@@ -184,7 +184,7 @@ func TestAutoDatasetDenoiseCancelAndNoPartialOutput(t *testing.T) {
 		<-ctx.Done()
 		return []asrResult{{Text: "should never publish", Provider: "fixture"}}, nil
 	}
-	q := autoDatasetRequest{[]string{selection}, "en", "", true}
+	q := autoDatasetRequest{References:[]string{selection}, Language:"en",Denoise:true}
 	j := postAutoFixture(t, s, q, fakeASR, fakeClean)
 	select {
 	case <-started:

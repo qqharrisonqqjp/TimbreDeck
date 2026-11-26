@@ -10,4 +10,6 @@
 /engines/indextts2/source.zip
 /config/
 /Start.exe
+/local-active.txt
+/TimbreDeck-AI-candidate.exe
 __pycache__/

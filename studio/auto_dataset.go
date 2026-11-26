@@ -34,6 +34,7 @@ type autoDatasetRequest struct {
 	Language   string   `json:"language"`
 	Speaker    string   `json:"speaker"`
 	Denoise    bool     `json:"denoise"`
+	ASRModel   string   `json:"asrModel,omitempty"`
 }
 
 type autoDatasetRecord struct {
@@ -52,7 +53,7 @@ type autoDatasetRecord struct {
 type autoDatasetASR func(context.Context, []string, string) ([]asrResult, error)
 
 func (s *studio) startAutoDataset(w http.ResponseWriter, r *http.Request) {
-	s.startAutoDatasetWith(w, r, s.recognizeFiles, runCleanWorker)
+	s.startAutoDatasetWith(w, r, nil, runCleanWorker)
 }
 
 func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, recognize autoDatasetASR, clean cleanRunner) {
@@ -65,6 +66,18 @@ func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	q.Speaker = strings.TrimSpace(q.Speaker)
+	if recognize == nil {
+		if q.ASRModel != "" {
+			_, root, err := s.asrRuntime()
+			if err != nil || !asrModelAvailable(root, q.ASRModel) {
+				fail(w, 422, "所選 ASR 模型未安裝或仍未整合。")
+				return
+			}
+		}
+		recognize = func(ctx context.Context, paths []string, lang string) ([]asrResult, error) {
+			return s.recognizeWithModel(ctx, paths, lang, q.ASRModel)
+		}
+	}
 	if q.Speaker == "" {
 		q.Speaker = "speaker-1"
 	}

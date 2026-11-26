@@ -15,10 +15,16 @@
           <span class="mark" aria-hidden="true">▮▥</span>TimbreDeck
           <small>聲台</small>
         </div>
-        <nav id="switcher" aria-label="引擎切換"></nav>
+        <button id="engine-open" type="button" aria-haspopup="dialog">選擇引擎</button>
         <select id="compact" aria-label="切換引擎"></select>
       </div>
     </header>
+    <dialog id="engine-dialog" aria-labelledby="engine-dialog-name">
+      <div class="row"><h2 id="engine-dialog-name">選擇合成引擎</h2><form method="dialog"><button type="submit">關閉</button></form></div>
+      <nav id="switcher" aria-label="引擎切換"></nav>
+    </dialog>
+    <div class="shell">
+    <aside><nav id="sections" aria-label="聲台工作區"></nav></aside>
     <main>
       <div class="headline">
         <div>
@@ -33,5 +39,6 @@
       <section id="work"></section>
       <p id="saved" role="status"></p>
     </main>
+    </div>
   </body>
 </html>

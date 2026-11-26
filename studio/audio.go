@@ -122,20 +122,37 @@ func (s *studio) reference(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, closeErr.Error())
 		return
 	}
-	secs, e := wavDuration(f.Name())
-	if e != nil {
-		fail(w, 422, e.Error())
-		return
-	}
+	source := f.Name()
 	key := hex.EncodeToString(h.Sum(nil))
+	original := key
+	secs, e := wavDuration(source)
+	if e != nil {
+		pending, err := os.CreateTemp(s.path("voices"), ".converted-*")
+		if err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		source = pending.Name()
+		pending.Close()
+		defer os.Remove(source)
+		secs, key, e = transcodeReference(r.Context(), f.Name(), source)
+		if e != nil {
+			fail(w, 422, e.Error())
+			return
+		}
+	}
 	path := s.path("voices", key+".wav")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if e = os.Rename(f.Name(), path); e != nil {
+		if e = os.Rename(source, path); e != nil {
+			if installedFile(path) {
+				send(w, 201, map[string]any{"id": key, "seconds": secs, "sourceSha256": original})
+				return
+			}
 			fail(w, 500, e.Error())
 			return
 		}
 	}
-	send(w, 201, map[string]any{"id": key, "seconds": secs})
+	send(w, 201, map[string]any{"id": key, "seconds": secs, "sourceSha256": original})
 }
 func (s *studio) referenceAudio(w http.ResponseWriter, r *http.Request) {
 	k := r.PathValue("id")
@@ -165,6 +182,9 @@ type request struct {
 	RefLang          string    `json:"refLang"`
 	Speed            float64   `json:"speed"`
 	Preview          bool      `json:"preview"`
+	SplitAt          int       `json:"splitAt,omitempty"`
+	SplitGapMS       int       `json:"splitGapMs,omitempty"`
+	SplitSeparate    bool      `json:"splitSeparate,omitempty"`
 }
 type recording struct {
 	ID             string    `json:"id"`
@@ -178,6 +198,7 @@ type recording struct {
 	RuntimeVersion string    `json:"runtimeVersion,omitempty"`
 	AudioAvailable bool      `json:"audioAvailable"`
 	VerifiedCUDA   string    `json:"verifiedCuda,omitempty"`
+	Parts          int       `json:"parts,omitempty"`
 }
 
 func firstSentence(s string) string {
@@ -202,6 +223,15 @@ func (s *studio) validate(q *request) error {
 	}
 	if q.Text == "" || len([]rune(q.Text)) > 10000 {
 		return errors.New("請輸入最多 10,000 字的台詞。")
+	}
+	if q.SplitAt != 0 && (q.SplitAt < 20 || q.SplitAt > 2000) || q.SplitGapMS < 0 || q.SplitGapMS > 5000 {
+		return errors.New("切分長度須為 20–2000 字；片段間隔須為 0–5000 毫秒。")
+	}
+	if q.SplitSeparate && (q.SplitAt == 0 || q.Preview) {
+		return errors.New("只可為全文切分輸出獨立片段。")
+	}
+	if q.SplitAt > 0 && !q.Preview && len(splitSynthesis(q.Text, q.SplitAt)) > 100 {
+		return errors.New("一次最多可切成 100 段，請提高切分字數或縮短台詞。")
 	}
 	if !capabilities.Speed {
 		if q.Speed != 0 && q.Speed != 1 {
@@ -363,43 +393,98 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 		emotionRef = s.path("voices", q.EmotionReference+".wav")
 	}
 	src, _ := assets.ReadFile("worker.py")
-	payload, e := json.Marshal(map[string]any{
-		"id": key, "request": q, "ref": ref, "emotionRef": emotionRef, "output": dst,
-		"trained":     trained,
-		"modelRoot":   splitRoot,
-		"diagnostics": filepath.Join(dir, "execution.json"),
-	})
-	if e != nil {
-		return e
-	}
 	logFile, e := os.Create(s.path("logs", key+".log"))
 	if e != nil {
 		return e
 	}
 	defer logFile.Close()
-	py := filepath.Join(root, "runtime", "python.exe")
-	cmd := exec.CommandContext(ctx, py, "-c", string(src))
-	cmd.Dir = root
-	cmd.Stdin = strings.NewReader(string(payload))
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	env := cmd.Environ()
-	cmd.Env = append(env, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8", "PYTHONNOUSERSITE=1", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "HF_HOME="+s.path("cache", "huggingface"), "TORCH_HOME="+s.path("cache", "torch"), "PATH="+filepath.Dir(py)+string(os.PathListSeparator)+root+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if e = cmd.Run(); e != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	parts := []string{q.Text}
+	if q.SplitAt > 0 && !q.Preview {
+		parts = splitSynthesis(q.Text, q.SplitAt)
+	}
+	diag := filepath.Join(dir, "execution.json")
+	var outcome []executionEvidence
+	var waves []string
+	for i, part := range parts {
+		if e = ctx.Err(); e != nil {
+			return e
 		}
-		return fmt.Errorf("引擎未能完成合成。請查看 logs/%s.log（%v）。", key, e)
+		target, pdiag := dst, diag
+		if len(parts) > 1 || q.SplitSeparate {
+			target = filepath.Join(dir, fmt.Sprintf("part-%03d.wav", i+1))
+			pdiag = filepath.Join(dir, fmt.Sprintf("part-%03d.json", i+1))
+		}
+		if len(parts) > 1 {
+			s.updateSynthesisProgress(key, i, len(parts))
+		}
+		input := q
+		input.Text = part
+		payload, e := json.Marshal(map[string]any{
+			"id": key, "request": input, "ref": ref, "emotionRef": emotionRef, "output": target,
+			"trained":     trained,
+			"modelRoot":   splitRoot,
+			"diagnostics": pdiag,
+		})
+		if e != nil {
+			return e
+		}
+		py := filepath.Join(root, "runtime", "python.exe")
+		cmd := exec.CommandContext(ctx, py, "-c", string(src))
+		cmd.Dir = root
+		cmd.Stdin = strings.NewReader(string(payload))
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		env := cmd.Environ()
+		cmd.Env = append(env, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8", "PYTHONNOUSERSITE=1", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "HF_HOME="+s.path("cache", "huggingface"), "TORCH_HOME="+s.path("cache", "torch"), "PATH="+filepath.Dir(py)+string(os.PathListSeparator)+root+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if e = cmd.Run(); e != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("第 %d/%d 段未能完成合成。請查看 logs/%s.log（%v）。", i+1, len(parts), key, e)
+		}
+		var x executionEvidence
+		_ = readJSON(pdiag, &x)
+		outcome = append(outcome, x)
+		waves = append(waves, target)
 	}
-	secs, rate, e := wavInfo(dst)
-	if e != nil {
-		return errors.New("引擎沒有輸出有效 WAV。")
+	var secs float64
+	var rate uint32
+	if len(parts) > 1 || q.SplitSeparate {
+		if q.SplitSeparate {
+			secs, rate, e = packSpeechParts(ctx, filepath.Join(dir, "parts.zip"), waves)
+		} else {
+			e = joinSpeech(ctx, dst, waves, q.SplitGapMS)
+		}
+		if e != nil {
+			return e
+		}
+		for i, path := range waves {
+			_ = os.Remove(path)
+			_ = os.Remove(filepath.Join(dir, fmt.Sprintf("part-%03d.json", i+1)))
+		}
+		if e = writeJSON(filepath.Join(dir, "segments.json"), map[string]any{"parts": parts, "gapMs": q.SplitGapMS, "execution": outcome}); e != nil {
+			return e
+		}
 	}
-	var diagnostics executionEvidence
-	_ = readJSON(filepath.Join(dir, "execution.json"), &diagnostics)
+	if !q.SplitSeparate {
+		secs, rate, e = wavInfo(dst)
+		if e != nil {
+			return errors.New("引擎沒有輸出有效 WAV。")
+		}
+	}
+	diagnostics := outcome[0]
 	record := recording{ID: key, Created: time.Now().UTC(), Seconds: secs, Input: q, VoiceName: voice,
-		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: true}
+		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: !q.SplitSeparate}
+	if q.SplitSeparate {
+		record.Parts = len(parts)
+	}
 	record.VerifiedCUDA = diagnostics.verifiedDevice(record)
+	for _, x := range outcome[1:] {
+		if x.verifiedDevice(record) != record.VerifiedCUDA {
+			record.VerifiedCUDA = ""
+			break
+		}
+	}
 	var pack manifest
 	if readJSON(filepath.Join(modelRoot, packMetadata), &pack) == nil && pack.check(q.Engine) == nil {
 		record.PackVersion = pack.Version

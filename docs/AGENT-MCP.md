@@ -10,6 +10,8 @@ python -B -X utf8 tools\td_agent.py --url http://127.0.0.1:49125 dataset --refer
 
 將範例網址和路徑換成實際位置。`td_agent.py --help` 和 `td_agent.py <動作> --help` 列出參數。
 
+錄音輸入亦可用 MP3、MP4、M4A、AAC、MOV（本機需 FFmpeg）；產物仍是 WAV 或 ZIP。`asr --asr-model` 指定已安裝模型。長台詞可用 `synthesize --split-at 160 --split-gap-ms 250`，如欲匯出分段 ZIP 則加上 `--separate-parts`。對應 MCP 參數為 `asr_model`、`split_at`、`split_gap_ms`、`separate_parts`。
+
 若使用這台 Windows 電腦的本機交付版，也可執行 `D:\TimbreDeck\TimbreDeck-AI.exe status`，或以 `D:\TimbreDeck\TimbreDeck-AI.exe mcp` 啟動 MCP。預設只共享 `D:\TimbreDeck\AI-Inbox`，新產物寫到 `D:\TimbreDeck\AI-Exports`。
 
 ## 用支援本機 stdio 的 MCP 客戶端

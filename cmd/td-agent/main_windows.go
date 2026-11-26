@@ -50,14 +50,13 @@ func sessionOK(data string) bool {
 	}
 	return resp.StatusCode == 200 && json.NewDecoder(io.LimitReader(resp.Body, 256<<10)).Decode(&v) == nil && v.Product == "TimbreDeck" && v.ApiVersion == 1 && v.Instance == m.Instance && v.PID == m.PID
 }
-func ensure(root, data string) error {
+func ensure(root, data, stage string) error {
 	if sessionOK(data) {
 		return nil
 	}
-	stage := filepath.Join(root, "asr-update")
 	c := exec.Command(filepath.Join(stage, "Start.exe"), "-no-browser", "-agent-idle", "10m", "-data", data)
 	c.Dir = stage
-	c.Env = append(os.Environ(), "PYTHONPATH=", "PYTHONHOME=", "PYTHONDONTWRITEBYTECODE=1", "PYTHONUTF8=1", "OMP_NUM_THREADS=4", "TIMBREDECK_CLEAN_ASSETS="+filepath.Join(root, "noise-update", "assets"), "MPLCONFIGDIR="+filepath.Join(data, "cache", "mpl"), "NUMBA_CACHE_DIR="+filepath.Join(data, "cache", "numba"), "MODELSCOPE_CACHE="+filepath.Join(data, "cache", "modelscope"))
+	c.Env = append(os.Environ(), "PYTHONPATH=", "PYTHONHOME=", "PYTHONDONTWRITEBYTECODE=1", "PYTHONUTF8=1", "OMP_NUM_THREADS=4", "TIMBREDECK_ASR_ASSETS="+filepath.Join(root, "asr-update", "assets"), "TIMBREDECK_CLEAN_ASSETS="+filepath.Join(root, "noise-update", "assets"), "MPLCONFIGDIR="+filepath.Join(data, "cache", "mpl"), "NUMBA_CACHE_DIR="+filepath.Join(data, "cache", "numba"), "MODELSCOPE_CACHE="+filepath.Join(data, "cache", "modelscope"))
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	if e := c.Start(); e != nil {
 		return e
@@ -85,6 +84,10 @@ func run() int {
 		return 1
 	}
 	root := filepath.Dir(app)
+	stage, tools := filepath.Join(root, "asr-update"), filepath.Join(root, "asr-update", "src", "tools")
+	if _, e := os.Stat(filepath.Join(root, "source", "local-active.txt")); e == nil {
+		stage, tools = filepath.Join(root, "source"), filepath.Join(root, "source", "tools")
+	}
 	args := os.Args[1:]
 	data := os.Getenv("TD_STUDIO_DATA")
 	if data == "" {
@@ -98,14 +101,13 @@ func run() int {
 		if len(args) > 1 {
 			return 2
 		}
-		if e = ensure(root, data); e != nil {
+		if e = ensure(root, data, stage); e != nil {
 			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": false, "error": e.Error()})
 			return 1
 		}
 		fmt.Println(`{"ok":true,"ready":true}`)
 		return 0
 	}
-	tools := filepath.Join(root, "asr-update", "src", "tools")
 	file := "td_agent.py"
 	if len(args) > 0 && args[0] == "mcp" {
 		file = "td_mcp.py"

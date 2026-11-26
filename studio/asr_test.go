@@ -63,7 +63,7 @@ func TestASRLocalModel(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &saved); err != nil || len(saved.ID) != 64 {
 			t.Fatalf("invalid import: %s (%v)", w.Body.String(), err)
 		}
-		body, err := json.Marshal(asrRequest{saved.ID, tc.language})
+		body, err := json.Marshal(asrRequest{Reference: saved.ID, Language: tc.language})
 		if err != nil {
 			t.Fatal(err)
 		}

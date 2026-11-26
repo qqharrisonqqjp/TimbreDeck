@@ -38,11 +38,13 @@ type studio struct {
 	files sync.Mutex
 }
 type job struct {
-	ID     string `json:"id"`
-	Engine string `json:"engine"`
-	Kind   string `json:"kind"`
-	Status string `json:"status"`
-	Detail string `json:"detail,omitempty"`
+	ID        string `json:"id"`
+	Engine    string `json:"engine"`
+	Kind      string `json:"kind"`
+	Status    string `json:"status"`
+	Detail    string `json:"detail,omitempty"`
+	Completed int    `json:"completed,omitempty"`
+	Total     int    `json:"total,omitempty"`
 }
 type settings struct {
 	Engine        string                     `json:"engine"`
@@ -50,6 +52,7 @@ type settings struct {
 	Reference     string                     `json:"reference"`
 	ReferenceName string                     `json:"referenceName"`
 	VoiceID       string                     `json:"voiceId,omitempty"`
+	ASRModel      string                     `json:"asrModel,omitempty"`
 	Drafts        map[string]json.RawMessage `json:"drafts"`
 }
 type installation struct {
@@ -376,11 +379,14 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("POST /api/engine", s.setPath)
 	m.HandleFunc("POST /api/reference", s.reference)
 	m.HandleFunc("POST /api/asr", s.asrHandler)
+	m.HandleFunc("GET /api/asr/models", s.asrModels)
 	m.HandleFunc("POST /api/datasets/auto", s.startAutoDataset)
 	m.HandleFunc("GET /api/datasets/auto", s.autoDatasetHistory)
 	m.HandleFunc("GET /api/datasets/auto/{id}/download", s.downloadAutoDataset)
 	m.HandleFunc("GET /api/profiles", s.profiles)
 	m.HandleFunc("POST /api/profiles", s.saveProfile)
+	m.HandleFunc("POST /api/avatars", s.saveAvatar)
+	m.HandleFunc("GET /api/avatars/{id}", s.avatar)
 	m.HandleFunc("PUT /api/profiles/{id}", s.saveProfile)
 	m.HandleFunc("DELETE /api/profiles/{id}", s.removeProfile)
 	m.HandleFunc("GET /api/training", s.trainingProjects)
@@ -401,6 +407,7 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("GET /api/unused-recordings", s.listUnusedRecordings)
 	m.HandleFunc("DELETE /api/unused-recordings/{id}", s.removeUnusedRecording)
 	m.HandleFunc("GET /api/audio/{id}", s.audio)
+	m.HandleFunc("GET /api/audio/{id}/parts", s.audioParts)
 	m.HandleFunc("GET /api/reference/{id}", s.referenceAudio)
 	m.HandleFunc("GET /api/job", func(w http.ResponseWriter, r *http.Request) { s.mu.Lock(); defer s.mu.Unlock(); send(w, 200, s.active) })
 	m.HandleFunc("POST /api/cancel/{id}", func(w http.ResponseWriter, r *http.Request) {

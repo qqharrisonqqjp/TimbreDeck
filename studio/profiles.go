@@ -16,6 +16,7 @@ type voiceProfile struct {
 	Transcript   string `json:"transcript"`
 	Language     string `json:"language"`
 	ModelProject string `json:"modelProject,omitempty"`
+	Avatar       string `json:"avatar,omitempty"`
 }
 
 func (s *studio) profilePath(id string) string {
@@ -80,6 +81,10 @@ func (s *studio) saveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := wavDuration(s.path("voices", profile.Reference+".wav")); err != nil {
 		fail(w, 422, "找不到有效的參考錄音。")
+		return
+	}
+	if profile.Avatar != "" && (!hexID(profile.Avatar, 64) || !installedFile(s.path("voices", "avatars", profile.Avatar+".png"))) {
+		fail(w, 422, "找不到角色頭像。")
 		return
 	}
 	if profile.ModelProject != "" {
