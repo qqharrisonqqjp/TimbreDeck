@@ -39,6 +39,24 @@ def execution_details(torch, model, modules, waveform_devices):
     return details
 
 
+def observe_tokenizer_decode(tokenizer_model, devices):
+    """Observe the real decoded waveform(s) before Qwen converts them to NumPy."""
+    method = getattr(tokenizer_model, "decode", None)
+    if method is None:
+        return
+
+    def observed(*args, **kwargs):
+        result = method(*args, **kwargs)
+        value = getattr(result, "audio_values", None)
+        waves = value if isinstance(value, (list, tuple)) else (value,)
+        for wave in waves:
+            device = getattr(wave, "device", None)
+            devices.add(str(device) if device is not None else "unknown")
+        return result
+
+    tokenizer_model.decode = observed
+
+
 def gpt(q, ref, output, _emotion_ref):
     import soundfile as sf
     import torch
@@ -217,6 +235,9 @@ def qwen(q, ref, output, _emotion_ref):
         str(Path(q["modelRoot"]) / "pretrained_models" / name), device_map=device, dtype=dtype,
         attn_implementation="sdpa", local_files_only=True,
     )
+    waveform_devices = set()
+    tokenizer = getattr(getattr(model.model, "speech_tokenizer", None), "model", None)
+    observe_tokenizer_decode(tokenizer, waveform_devices)
     options = dict(text=q["text"], language=QWEN_LANGUAGES[q["language"]])
     if q["mode"] == "design":
         wavs, rate = model.generate_voice_design(instruct=q["instruction"], **options)
@@ -229,7 +250,7 @@ def qwen(q, ref, output, _emotion_ref):
         )
     samples, = wavs
     sf.write(output, samples, rate, subtype="PCM_16")
-    return execution_details(torch, name, {"tts": model.model}, set())
+    return execution_details(torch, name, {"tts": model.model, "tokenizer": tokenizer}, waveform_devices)
 
 
 ADAPTERS = {

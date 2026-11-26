@@ -1,5 +1,7 @@
 # TimbreDeck 聲台 · Windows 預覽版
 
+本機五引擎候選版請參閱[實機驗收、跨語言比較與重測](WINDOWS-ACCEPTANCE.zh-HK.md)。下文保留原預覽版的安裝與介接說明。
+
 ## 開始使用
 
 1. 從 [Releases（發佈頁）](https://github.com/qqharrisonqqjp/TimbreDeck/releases) 下載 `TimbreDeck-Windows-x64.zip`，解壓到自己可寫入的資料夾。雙擊 `Start.exe`。啟動器會開啟預設瀏覽器。工作期間保留主控台，若瀏覽器未自動開啟，可複製主控台顯示的本機網址。

@@ -129,10 +129,14 @@ class cuda:
     is_available = staticmethod(lambda: False)
 """
 VOX = DEVICE_FIXTURE + """
+from pathlib import Path
+
 class VoxCPM:
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        assert path == "pretrained_models/VoxCPM2"
+        model = Path(path)
+        assert model.parts[-2:] == ("pretrained_models", "VoxCPM2"), path
+        assert (model / "config.json").is_file(), path
         assert kwargs == dict(load_denoiser=False, local_files_only=True, optimize=False)
         model = cls()
         model.tts_model = Module("cpu")

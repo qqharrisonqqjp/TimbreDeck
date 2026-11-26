@@ -950,6 +950,7 @@ async function history() {
             " 秒" + (x.sampleRate ? "　" + x.sampleRate + " Hz" : ""),
         ),
         hint([x.voiceName, x.model || x.input.variant, x.packVersion].filter(Boolean).join(" · ") || "預覽版記錄"),
+        hint(x.verifiedCuda ? "已核對波形及主模型：" + x.verifiedCuda : "未有完整 CUDA 作業證據"),
         el("p", { className: "history-text" }, x.input.text),
         el("details", {},
           el("summary", {}, "合成設定"),

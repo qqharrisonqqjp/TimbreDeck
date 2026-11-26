@@ -177,6 +177,7 @@ type recording struct {
 	PackVersion    string    `json:"packVersion,omitempty"`
 	RuntimeVersion string    `json:"runtimeVersion,omitempty"`
 	AudioAvailable bool      `json:"audioAvailable"`
+	VerifiedCUDA   string    `json:"verifiedCuda,omitempty"`
 }
 
 func firstSentence(s string) string {
@@ -394,10 +395,11 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 	if e != nil {
 		return errors.New("引擎沒有輸出有效 WAV。")
 	}
-	var diagnostics struct{ Model string }
+	var diagnostics executionEvidence
 	_ = readJSON(filepath.Join(dir, "execution.json"), &diagnostics)
 	record := recording{ID: key, Created: time.Now().UTC(), Seconds: secs, Input: q, VoiceName: voice,
 		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: true}
+	record.VerifiedCUDA = diagnostics.verifiedDevice(record)
 	var pack manifest
 	if readJSON(filepath.Join(modelRoot, packMetadata), &pack) == nil && pack.check(q.Engine) == nil {
 		record.PackVersion = pack.Version
@@ -431,6 +433,13 @@ func (s *studio) history(w http.ResponseWriter, r *http.Request) {
 		}
 		var v recording
 		if readJSON(s.path("outputs", d.Name(), "record.json"), &v) == nil && v.ID == d.Name() {
+			// Old records remain untouched. Read their sidecar when available.
+			if v.VerifiedCUDA == "" {
+				var x executionEvidence
+				if readJSON(s.path("outputs", d.Name(), "execution.json"), &x) == nil {
+					v.VerifiedCUDA = x.verifiedDevice(v)
+				}
+			}
 			v.AudioAvailable = installedFile(s.path("outputs", d.Name(), "speech.wav"))
 			items = append(items, v)
 		}

@@ -17,6 +17,9 @@ import wave
 CUDA_MODULES = {
     "gpt-sovits": ("t2s_model", "vits_model"),
     "cosyvoice3": ("llm", "flow", "hift"),
+    "voxcpm2": ("tts",),
+    "indextts2": ("gpt", "semantic_model", "semantic_codec", "s2mel", "bigvgan"),
+    "qwen3-tts": ("tts", "tokenizer"),
 }
 
 
@@ -66,12 +69,16 @@ def measure(audio):
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("launcher", type=Path)
-    cli.add_argument("reference", type=Path, help="3–10 second Cantonese WAV")
+    cli.add_argument("reference", type=Path, help="3–10 second reference WAV")
     cli.add_argument("transcript", help="exact words in the reference")
     cli.add_argument("destination", type=Path, help="new directory for this run")
     cli.add_argument("--gpt", type=Path, help="complete GPT-SoVITS v2Pro root")
     cli.add_argument("--cosy", type=Path, help="complete CosyVoice 3 root")
     cli.add_argument("--text", default="今晚八點半喺旺角站等。")
+    cli.add_argument("--ref-lang", choices=("yue", "en"), default="yue",
+                     help="language actually spoken in the reference")
+    cli.add_argument("--output-lang", choices=("yue", "en"), default="yue",
+                     help="language of --text, independently of the reference")
     cli.add_argument("--timeout", type=int, default=1200, help="seconds per engine")
     cli.add_argument("--require-cuda", action="store_true",
                      help="require job-linked Windows CUDA evidence for every selected engine")
@@ -82,7 +89,8 @@ def main():
     audio = args.reference.read_bytes()
     target = args.destination.resolve()
     target.mkdir(parents=True, exist_ok=False)
-    report = dict(reference_sha256=hashlib.sha256(audio).hexdigest(), text=args.text,
+    report = dict(reference_sha256=hashlib.sha256(audio).hexdigest(), reference_language=args.ref_lang,
+                  reference_transcript=args.transcript, output_language=args.output_lang, text=args.text,
                   require_cuda=args.require_cuda, engines={})
     launcher = subprocess.Popen([str(args.launcher.resolve()), "-no-browser", "-data", str(target)],
                                 stdout=subprocess.PIPE, encoding="utf-8")
@@ -112,7 +120,7 @@ def main():
                 api("engine", dict(engine=engine, path=str(root.resolve())))
                 req = dict(engine=engine, mode="clone", reference=ref["id"], preview=False,
                            text=args.text, transcript=args.transcript, speed=1,
-                           refLang="yue", language="yue")
+                           refLang=args.ref_lang, language=args.output_lang)
                 key = api("synthesize", req)["id"]
                 entry["job"] = key
                 try:

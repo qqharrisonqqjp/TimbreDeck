@@ -46,8 +46,6 @@ infer = SimpleNamespace()
             'assert config["custom"]["vits_weights_path"].endswith("learned.pth")',
             'assert config["custom"]["vits_weights_path"].endswith("s2Gv2Pro.pth")',
         ))
-        vox = fixture_runtimes / "voxcpm2/src/voxcpm/__init__.py"
-        vox.write_text(vox.read_text().replace('path == "pretrained_models/VoxCPM2"', 'path.endswith("VoxCPM2")'))
         index = fixture_runtimes / "indextts2"
         file(index / "huggingface_hub/constants.py", "")
         file(index / "transformers/utils/hub.py", "")

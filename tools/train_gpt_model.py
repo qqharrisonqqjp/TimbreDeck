@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from prepare_gpt_dataset import REVISION, sha256_file
@@ -160,4 +161,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Redirected Windows consoles can use a legacy code page. A completed
+    # training run must not exit 1 merely because its result path is Chinese.
+    sys.stdout.reconfigure(errors="backslashreplace")
     main()
