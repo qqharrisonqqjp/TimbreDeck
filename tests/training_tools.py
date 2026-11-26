@@ -17,7 +17,13 @@ SAMPLE = "a" * 32 + ".wav"
 SPEAKER = "b" * 32
 COMMON = """import os
 from pathlib import Path
+from timbredeck_fixture_gpt import GPT_IMPORT
+from timbredeck_fixture_engine import ENGINE_IMPORT
+from timbredeck_fixture_eres import ERES_IMPORT
 assert os.environ["HF_HUB_OFFLINE"] == "1"
+assert os.environ["version"] == "v2Pro"
+assert GPT_IMPORT and ENGINE_IMPORT and ERES_IMPORT
+Path("scratch-stage.tmp").write_text("relative stage temp file")
 out = Path(os.environ["opt_dir"])
 def make(folder, name):
     (out/folder).mkdir(exist_ok=True)
@@ -38,6 +44,9 @@ def main():
         else:
             executable.symlink_to(sys.executable)
         gpt = engine / "GPT_SoVITS"
+        file(engine / "timbredeck_fixture_engine.py", "ENGINE_IMPORT = True\n")
+        file(gpt / "timbredeck_fixture_gpt.py", "GPT_IMPORT = True\n")
+        file(gpt / "eres2net/timbredeck_fixture_eres.py", "ERES_IMPORT = True\n")
         config = gpt / "configs"
         file(config / "s2v2Pro.json", '{"train": {}, "model": {}, "data": {}}')
         file(config / "s1longer-v2.yaml", 'train: {}')
@@ -59,6 +68,9 @@ def main():
         features = root / "features"
         prep = [sys.executable, str(REPO / "tools/prepare_gpt_dataset.py"), str(engine), str(dataset)]
         subprocess.run([*prep, str(features)], env=env, check=True)
+        assert not list(engine.rglob("scratch-stage.tmp"))
+        assert not list(engine.rglob("__pycache__"))
+        assert not list(features.rglob("scratch-stage.tmp"))
         assert (features / "6-name2semantic.tsv").read_text().splitlines()[0] == "item_name\tsemantic_audio"
         meta = json.loads((features / "preparation.json").read_text())
         assert SAMPLE in meta["wav_sha256"]

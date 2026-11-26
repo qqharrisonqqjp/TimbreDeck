@@ -13,6 +13,9 @@ const catalog = {
     "以 Base、CustomVoice 或 VoiceDesign 選擇聲線。",
   ],
 };
+const cleanWorkspace = ["去去除雜聲", "批量清理本機 WAV，按指定次序合併及匯出。"];
+const workspaces = { ...catalog, clean: cleanWorkspace };
+let cleanOpen = false;
 const integrated = (k) => Boolean(engines[k]?.modes?.length);
 const lang = {
   yue: "粵語（可夾英語）",
@@ -106,6 +109,7 @@ function canRun(engine, mode) {
   return engine.ready && (!mode.variant || engine.availableVariants?.includes(mode.variant));
 }
 function panel() {
+  if (cleanOpen) return "clean";
   const v = d().tab;
   if (v === "training" && draft.engine === "gpt-sovits") return v;
   return ["models", "history", "voices", "storage"].includes(v)
@@ -150,11 +154,19 @@ function area(id, value, placeholder, update) {
   });
 }
 function setEngine(k) {
-  draft.engine = k;
-  persist();
+  if (k === "clean") {
+    cleanOpen = true;
+  } else {
+    cleanOpen = false;
+    if (draft.engine !== k) {
+      draft.engine = k;
+      persist();
+    }
+  }
   render();
 }
 function setTab(k) {
+  cleanOpen = false;
   d().tab = k;
   persist();
   render();
@@ -162,7 +174,9 @@ function setTab(k) {
 function selectedVoice() {
   return voices.find((voice) => voice.id === draft.voiceId);
 }
+let referenceMutation = 0, voiceUploadTicket = 0, emotionUploadTicket = 0;
 function useVoice(voice) {
+  referenceMutation++;
   draft.voiceId = voice.id;
   draft.reference = voice.reference;
   draft.referenceName = voice.name;
@@ -187,6 +201,7 @@ function referenceTranscript(settings) {
   return (!settings.transcriptFor || belongsToReference) ? settings.transcript : "";
 }
 function replaceReference(reference, name) {
+  referenceMutation++;
   for (const settings of Object.values(draft.drafts)) {
     if (!settings.transcriptFor && settings.transcript)
       settings.transcriptFor = draft.reference || "";
@@ -197,24 +212,32 @@ function replaceReference(reference, name) {
 }
 function render() {
   renderID++;
-  const k = draft.engine;
+  const k = cleanOpen ? "clean" : draft.engine;
   document.body.dataset.engine = k;
-  $("title").textContent = catalog[k][0];
-  $("subtitle").textContent = catalog[k][1];
-  $("state").textContent = !integrated(k)
+  $("title").textContent = workspaces[k][0];
+  $("subtitle").textContent = workspaces[k][1];
+  $("state").textContent = cleanOpen ? "本機工具" : !integrated(k)
     ? "待接通"
     : engines[k].ready
       ? "已找到引擎檔案"
       : engines[k].engineInstalled ? "未安裝模型" : "未安裝引擎";
   $("notice").textContent = "";
   $("switcher").replaceChildren(
-    ...Object.keys(catalog).map((id) =>
-      btn(catalog[id][0], () => setEngine(id), {
+    ...Object.keys(workspaces).map((id) =>
+      btn(workspaces[id][0], () => setEngine(id), {
         "aria-pressed": String(id === k),
       }),
     ),
   );
   $("compact").value = k;
+  if (cleanOpen) {
+    $("tabs").hidden = true;
+    $("tabs").replaceChildren();
+    cleaning();
+    showJob();
+    return;
+  }
+  $("tabs").hidden = false;
   const tabs = {
     ...(integrated(k) ? { synth: "語音合成" } : {}),
     models: "模型管理",
@@ -238,6 +261,611 @@ function render() {
   else history();
   showJob();
 }
+const cleanModes = {
+  denoise: "基礎去噪",
+  uvr: "UVR 人聲分離",
+  both: "先用 UVR5 分離人聲，再做語音降噪",
+};
+const cleanMaxClips = 24;
+const cleanMaxGap = 3000;
+const cleanMaxSeconds = 180;
+const cleanQueue = [];
+const cleanNames = new Map();
+let cleanChoices = new Map(),
+  cleanChoice = "",
+  cleanMode = "denoise",
+  cleanGap = "0",
+  cleanLoading = false,
+  cleanImporting = false,
+  cleanSubmitting = false;
+const cleanRefURL = (id) => "/api/reference/" + id;
+const cleanAudioURL = (id) => "/api/clean/audio/" + id;
+const validRef = (id) => typeof id === "string" && /^[a-f0-9]{64}$/.test(id);
+const clipName = (id) => "參考錄音 " + id.slice(0, 8);
+function cleanGapValue() {
+  const n = Number(cleanGap);
+  return cleanGap.trim() && Number.isInteger(n) && n >= 0 && n <= cleanMaxGap ? n : null;
+}
+function cleanDuration() {
+  const gap = cleanGapValue();
+  if (gap === null || !cleanQueue.length || !cleanQueue.every((clip) => Number.isFinite(clip.seconds))) return null;
+  return cleanQueue.reduce((total, clip) => total + clip.seconds, 0) + (cleanQueue.length - 1) * gap / 1000;
+}
+function cleanEditLocked() {
+  return cleanSubmitting || cleanImporting;
+}
+function cleanStatus() {
+  const run = $("clean-run");
+  if (!run) return;
+  const busy = ["running", "cancelling"].includes(currentJob?.status);
+  const gap = cleanGapValue(), duration = cleanDuration();
+  run.disabled = busy || cleanEditLocked() || !cleanQueue.length || gap === null ||
+    (duration !== null && duration > cleanMaxSeconds);
+  const capacity = cleanQueue.length >= cleanMaxClips;
+  $("clean-add").disabled = cleanEditLocked() || capacity || !cleanChoices.has(cleanChoice);
+  $("clean-upload").disabled = cleanEditLocked() || capacity;
+  const errors = [
+    gap === null && "間隔必須是 0 至 3,000 毫秒的整數。",
+    duration !== null && duration > cleanMaxSeconds && "合併後超過 180 秒，請減少音檔或縮短間隔。",
+  ].filter(Boolean);
+  $("clean-gap").setAttribute("aria-invalid", String(gap === null));
+  $("clean-length").textContent = [
+    cleanQueue.length + " / " + cleanMaxClips + " 段",
+    duration !== null && "預計 " + duration.toFixed(1) + " 秒",
+    cleanImporting && "正在匯入…",
+    cleanSubmitting && "正在提交…",
+    ...errors,
+  ].filter(Boolean).join(" · ");
+}
+function cleanPreview() {
+  const p = $("clean-reference-preview");
+  if (!p) return;
+  const clip = cleanChoices.get(cleanChoice);
+  p.replaceChildren(...(clip ? [
+    el("audio", { controls: true, preload: "none", src: cleanRefURL(clip.id), "aria-label": "試聽已選參考錄音" }),
+  ] : []));
+}
+function fillCleanPicker() {
+  const picker = $("clean-existing");
+  if (!picker) return;
+  if (!cleanChoices.has(cleanChoice)) cleanChoice = "";
+  picker.replaceChildren(new Option(cleanChoices.size ? "選擇一段參考錄音" :
+    cleanLoading ? "正在尋找本機錄音…" : "沒有已存參考錄音", ""), ...Array.from(
+    cleanChoices.values(), ({ id, name }) => new Option(name, id),
+  ));
+  picker.value = cleanChoice;
+  const shown = $("clean-reference-preview")?.querySelector("audio")?.getAttribute("src");
+  if (shown !== (cleanChoice ? cleanRefURL(cleanChoice) : undefined)) cleanPreview();
+  cleanStatus();
+}
+function collectCleanRefs(...groups) {
+  const choices = new Map();
+  function add(clip) {
+    if (!validRef(clip.id)) return;
+    const old = choices.get(clip.id);
+    const known = cleanNames.get(clip.id);
+    choices.set(clip.id, {
+      id: clip.id,
+      name: known?.name || old?.name || clip.name || clipName(clip.id),
+      seconds: known?.seconds ?? old?.seconds ?? clip.seconds,
+    });
+  }
+  for (const v of voices) add({ id: v.reference, name: v.name });
+  add({ id: draft.reference, name: draft.referenceName });
+  for (const settings of Object.values(draft.drafts)) {
+    if (!settings) continue;
+    for (const field of ["reference", "emotionReference", "transcriptFor", "refLangFor"]) {
+      const name = field === "emotionReference" ? settings.emotionReferenceName : undefined;
+      add({ id: settings[field], name });
+    }
+  }
+  for (const group of groups) group.forEach(add);
+  for (const clip of cleanNames.values()) add(clip);
+  return choices;
+}
+async function loadCleanRefs(mark) {
+  cleanLoading = true;
+  fillCleanPicker();
+  const settled = await Promise.allSettled([api("unused-recordings"), api("history"), api("training")]);
+  if (mark !== renderID || !cleanOpen) return;
+  const [unused, history, projects] = settled.map((r) => Array.isArray(r.value) ? r.value : []);
+  cleanChoices = collectCleanRefs(
+    projects.flatMap((p) => (p.clips || []).map((clip) => ({
+      id: clip.reference, name: clip.sourceName || p.name,
+    }))),
+    history.flatMap(({ input, voiceName }) => input ? [
+      { id: input.reference, name: voiceName }, { id: input.emotionReference },
+    ] : []),
+    unused,
+  );
+  cleanLoading = false;
+  fillCleanPicker();
+  $("clean-refs-info").textContent = settled.some((r) => r.status === "rejected")
+    ? "部分舊錄音未能列出；仍可匯入 WAV，或使用目前可見的錄音。" : "";
+}
+function drawCleanQueue() {
+  const list = $("clean-queue");
+  if (!list) return;
+  function changeClip(index, shift) {
+    if (cleanEditLocked()) return;
+    if (shift) {
+      const to = index + shift;
+      [cleanQueue[index], cleanQueue[to]] = [cleanQueue[to], cleanQueue[index]];
+      drawCleanQueue();
+      const focus = $("clean-" + (shift < 0 ? "up" : "down") + "-" + to);
+      (focus.disabled ? $("clean-remove-" + to) : focus).focus();
+    } else {
+      cleanQueue.splice(index, 1);
+      drawCleanQueue();
+      ($("clean-remove-" + Math.min(index, cleanQueue.length - 1)) || $("clean-upload")).focus();
+    }
+  }
+  list.replaceChildren(...cleanQueue.map((clip, i) =>
+    el("li", { className: "clean-clip" },
+      box("clean-row",
+        el("strong", { className: "file-name" }, clip.name),
+        Number.isFinite(clip.seconds) ? el("small", {}, clip.seconds.toFixed(1) + " 秒") : "",
+        box("actions clean-actions",
+          btn("上移", () => changeClip(i, -1), { id: "clean-up-" + i, disabled: i === 0 || cleanEditLocked(), "aria-label": "上移第 " + (i + 1) + " 段" }),
+          btn("下移", () => changeClip(i, 1), { id: "clean-down-" + i, disabled: i === cleanQueue.length - 1 || cleanEditLocked(), "aria-label": "下移第 " + (i + 1) + " 段" }),
+          btn("移除", () => changeClip(i, 0), { id: "clean-remove-" + i, disabled: cleanEditLocked(), "aria-label": "移除第 " + (i + 1) + " 段" }),
+          btn("辨識", () => { cleanASRReference = clip.id; drawCleanASR(); }, { "aria-label": "辨識第 " + (i + 1) + " 段" }),
+        ),
+      ),
+      el("audio", { controls: true, preload: "none", src: cleanRefURL(clip.id), "aria-label": "試聽 " + clip.name }),
+    ),
+  ));
+  $("clean-queue-empty").hidden = cleanQueue.length > 0;
+  cleanStatus();
+  drawCleanASR();
+}
+async function cleanUpload(input) {
+  if (cleanImporting || cleanSubmitting) return;
+  const files = Array.from(input.files);
+  if (!files.length) return;
+  input.value = "";
+  cleanImporting = true;
+  drawCleanQueue();
+  const problems = [];
+  let accepted = 0;
+  try {
+    for (const file of files) {
+      if (cleanQueue.length >= cleanMaxClips) {
+        problems.push("待清理清單上限為 24 段，未匯入其餘檔案。");
+        break;
+      }
+      try {
+        const r = await api("reference", "POST", file);
+        if (!validRef(r.id)) throw Error("啟動器沒有回傳錄音編號。");
+        const clip = { id: r.id, name: file.name, seconds: r.seconds };
+        if (!cleanNames.has(r.id)) cleanNames.set(r.id, clip);
+        cleanChoices.set(r.id, cleanNames.get(r.id));
+        cleanQueue.push(clip);
+        accepted++;
+      } catch (e) {
+        problems.push(file.name + "：" + e.message);
+      }
+    }
+  } finally {
+    cleanImporting = false;
+    if (cleanOpen) {
+      drawCleanQueue();
+      fillCleanPicker();
+      notice([accepted && "已匯入 " + accepted + " 段 WAV。", ...problems].filter(Boolean).join(" "));
+    }
+  }
+}
+async function startClean() {
+  if ($("clean-run").disabled) return;
+  cleanSubmitting = true;
+  drawCleanQueue();
+  try {
+    currentJob = await api("clean", "POST", {
+      references: cleanQueue.map(({ id }) => id),
+      mode: cleanMode,
+      gapMs: cleanGapValue(),
+    });
+    showJob();
+  } finally {
+    cleanSubmitting = false;
+    if (cleanOpen) drawCleanQueue();
+  }
+}
+let cleanHistoryRequest = 0;
+async function loadCleanHistory(mark = renderID) {
+  const history = $("clean-history-content");
+  if (!history) return;
+  const request = ++cleanHistoryRequest;
+  const live = () => mark === renderID && cleanOpen && request === cleanHistoryRequest;
+  try {
+    const rows = await api("clean/history");
+    if (!live()) return;
+    const files = (rows || []).filter((row) => typeof row.id === "string" && /^[a-f0-9]{32}$/.test(row.id));
+    history.replaceChildren(...(files.length ? files.map(({ id, mode, count, seconds }) =>
+      el("article", { className: "clean-result" },
+        el("h3", {}, cleanModes[mode] || "清理完成"),
+        hint(count + " 段 · " + Number(seconds).toFixed(1) + " 秒"),
+        box("history-actions",
+          el("audio", { controls: true, preload: "none", src: cleanAudioURL(id), "aria-label": "試聽清理結果 " + id.slice(0, 8) }),
+          el("a", { className: "linkbtn", href: cleanAudioURL(id) + "?download=1", download: "" }, "匯出 WAV"),
+        ),
+      ),
+    ) : [hint("完成清理後，可在這裏試聽和下載 WAV。")]));
+  } catch (e) {
+    if (live()) history.replaceChildren(hint("未能讀取清理歷史：" + e.message));
+  }
+}
+function cleaning() {
+  const realMark = renderID;
+  cleanChoices = collectCleanRefs(Array.from(cleanChoices.values()));
+  const upload = el("input", {
+    id: "clean-upload", type: "file", accept: ".wav,audio/wav", multiple: true,
+    onchange: (e) => cleanUpload(e.target).catch(notice),
+  });
+  const picker = el("select", {
+    id: "clean-existing",
+    onchange: (e) => {
+      cleanChoice = e.target.value;
+      cleanPreview();
+      cleanStatus();
+    },
+  });
+  const mode = select(cleanModes, cleanMode, (v) => { cleanMode = v; }, "clean-mode");
+  const gap = el("input", {
+    type: "number", id: "clean-gap", min: "0", max: String(cleanMaxGap), step: "1", value: cleanGap,
+    "aria-describedby": "clean-length",
+    oninput: (e) => { cleanGap = e.target.value; cleanStatus(); },
+  });
+  $("work").replaceChildren(
+    box("grid",
+      card("加入錄音",
+        field("匯入 WAV（可選多個）", upload),
+        field("已存參考錄音", picker),
+        el("p", { id: "clean-refs-info", className: "hint", role: "status" }),
+        el("div", { id: "clean-reference-preview", className: "clean-preview" }),
+        btn("加入所選錄音", () => {
+          const clip = cleanChoices.get(cleanChoice);
+          if (!clip || cleanEditLocked() || cleanQueue.length >= cleanMaxClips) return;
+          cleanQueue.push(clip);
+          drawCleanQueue();
+        }, { id: "clean-add" }),
+      ),
+      card("清理及合併",
+        field("清理模式", mode),
+        field("段與段之間的間隔（毫秒）", gap),
+        hint("最多 24 段；合併後連間隔最長 180 秒。"),
+        el("p", { id: "clean-length", className: "hint", role: "status" }),
+        btn("開始清理", startClean, { id: "clean-run", className: "primary" }),
+      ),
+    ),
+    card("清理次序",
+      el("p", { id: "clean-queue-empty", className: "hint" }, "先匯入 WAV 或加入已存錄音。順序會用於合併。"),
+      el("ol", { id: "clean-queue", className: "clean-queue", "aria-label": "待清理錄音次序" }),
+      el("div", { id: "clean-asr-work" }),
+    ),
+    card("清理歷史",
+      el("div", { id: "clean-history-content", "aria-live": "polite" }, hint("正在讀取清理歷史…")),
+    ),
+  );
+  drawCleanQueue();
+  loadCleanRefs(realMark);
+  loadCleanHistory(realMark);
+}
+
+const asrContexts = new Map();
+let asrOwnerID = 0;
+const asrOwners = new WeakMap();
+function ownerID(owner) {
+  if (!asrOwners.has(owner)) asrOwners.set(owner, ++asrOwnerID);
+  return asrOwners.get(owner);
+}
+function knownRefLanguage(v, fallback = "auto") {
+  return Object.hasOwn(referenceLanguages, v) ? v : fallback;
+}
+function refLanguage(k, settings, ref = draft.reference || "", voice = selectedVoice()) {
+  const fallback = k === "gpt-sovits" ? "yue" : "auto";
+  const matching = settings.refLangFor === ref || !settings.refLangFor;
+  return knownRefLanguage(
+    (settings.refLangFor === ref && settings.refLang) ||
+    voice?.language || (matching && settings.refLang), fallback);
+}
+function asrContext(key, source) {
+  let ctx = asrContexts.get(key);
+  if (!ctx) {
+    ctx = {
+      reference: source.reference,
+      language: knownRefLanguage(source.language),
+      text: source.text || "",
+      manual: !!source.manual,
+      ticket: 0, pending: false, requested: false, message: "", suggestion: null,
+    };
+    asrContexts.set(key, ctx);
+  }
+  ctx.commit = source.commit;
+  return ctx;
+}
+function speakerASR(k, settings) {
+  const reference = draft.reference || "", voice = selectedVoice(), identity = voice?.id || "";
+  const key = ["synth", k, reference, identity, voice?.transcript || ""].join("|");
+  const initialText = reference ? referenceTranscript(settings) || "" : "";
+  const bound = settings.transcriptFor === reference && (!voice || settings.transcriptVoice === identity);
+  const owner = asrContext(key, {
+    reference, text: initialText, language: refLanguage(k, settings, reference, voice),
+    manual: bound ? settings.transcriptManual !== false && (!!initialText || settings.transcriptManual === true) : !!initialText,
+    commit: (ctx) => {
+      if ((draft.reference || "") !== reference || (draft.voiceId || "") !== identity || !reference) return;
+      settings.refLangFor = reference;
+      settings.refLang = ctx.language;
+      settings.transcriptFor = reference;
+      settings.transcriptVoice = identity;
+      settings.transcript = ctx.text;
+      settings.transcriptManual = ctx.manual;
+      changed();
+    },
+  });
+  return owner;
+}
+function emotionASR(settings) {
+  const reference = settings.emotionReference || "";
+  const saved = settings.emotionASR?.reference === reference ? settings.emotionASR : {};
+  return asrContext(["emotion", ownerID(settings), reference].join("|"), {
+    reference, text: saved.text, language: saved.language, manual: saved.manual,
+    commit: (ctx) => {
+      if (!reference || settings.emotionReference !== reference) return;
+      settings.emotionASR = { reference, language: ctx.language, text: ctx.text, manual: ctx.manual };
+      changed();
+    },
+  });
+}
+function profileASR(voice) {
+  const reference = voice.reference || "";
+  return asrContext(["voice", ownerID(voice), reference].join("|"), {
+    reference, language: voice.language, text: voice.transcript, manual: !!voice.transcript,
+    commit: (ctx) => {
+      if (voice === editingVoice && reference === voice.reference) {
+        voice.language = ctx.language;
+        voice.transcript = ctx.text;
+      }
+    },
+  });
+}
+function asrPaint(ctx) {
+  const bound = ctx.view;
+  if (!bound) return;
+  if (bound.text.value !== ctx.text) bound.text.value = ctx.text;
+  if (bound.language.value !== ctx.language) bound.language.value = ctx.language;
+  bound.status.textContent = ctx.message || (!ctx.reference ? "先匯入或選擇參考錄音。" : "");
+  bound.retry.disabled = !ctx.reference || ctx.pending;
+  bound.apply.hidden = !ctx.suggestion;
+  bound.apply.disabled = !ctx.suggestion;
+  bound.proposal.hidden = !ctx.suggestion;
+  bound.proposal.textContent = ctx.suggestion?.text || "";
+  if (bound.text.id === "transcript" && bound.root.isConnected) syncSynthesisControls();
+}
+async function recognizeReference(ctx) {
+  if (!ctx.reference) return;
+  const ticket = ++ctx.ticket, language = ctx.language, reference = ctx.reference;
+  ctx.requested = true;
+  ctx.pending = true;
+  ctx.suggestion = null;
+  ctx.message = "正在辨識本機錄音…";
+  asrPaint(ctx);
+  try {
+    const result = await api("asr", "POST", { reference, language });
+    if (ticket !== ctx.ticket) return;
+    const text = typeof result.text === "string" ? result.text.trim().slice(0, 10000) : "";
+    if (!text) throw Error("未辨識出清楚對白。");
+    const label = [typeof result.provider === "string" && result.provider,
+      typeof result.language === "string" && (lang[result.language] || result.language)].filter(Boolean).join(" · ");
+    if (ctx.manual) {
+      ctx.suggestion = text === ctx.text ? null : { text };
+      ctx.message = "已保留手動編輯" + (ctx.suggestion ? "；可另行採用辨識結果" : "") + (label ? "（" + label + "）" : "") + "。";
+    } else {
+      ctx.text = text;
+      ctx.commit?.(ctx);
+      ctx.message = "逐字稿已自動填入，可先校對" + (label ? "（" + label + "）" : "") + "。";
+    }
+  } catch (e) {
+    if (ticket !== ctx.ticket) return;
+    ctx.message = "辨識未完成：" + e.message + " 可重試或手動輸入。";
+  } finally {
+    if (ticket === ctx.ticket) {
+      ctx.pending = false;
+      asrPaint(ctx);
+    }
+  }
+}
+function asrPanel(prefix, ctx, options = {}) {
+  const language = select(referenceLanguages, ctx.language, (value) => {
+    if (value === ctx.language) return;
+    ctx.language = knownRefLanguage(value);
+    if (!ctx.manual) ctx.text = "";
+    ctx.commit?.(ctx);
+    recognizeReference(ctx);
+  }, options.languageID || prefix + "-language");
+  language.disabled = !ctx.reference && !!options.disableLanguageWithoutRef;
+  const text = area(options.textID || prefix + "-transcript", ctx.text, "可手動校對錄音中的實際對白", (value) => {
+    ctx.text = value;
+    ctx.manual = true;
+    ctx.commit?.(ctx);
+    asrPaint(ctx);
+  });
+  text.maxLength = 10000;
+  text.disabled = !ctx.reference;
+  const status = el("p", { id: prefix + "-status", className: "asr-status hint", role: "status" });
+  const proposal = el("p", { className: "asr-status hint", hidden: true });
+  const retry = btn("重新辨識", () => recognizeReference(ctx));
+  const apply = btn("採用辨識結果", () => {
+    if (!ctx.suggestion) return;
+    ctx.text = ctx.suggestion.text;
+    ctx.suggestion = null;
+    ctx.manual = false;
+    ctx.message = "已採用辨識結果，可繼續校對。";
+    ctx.commit?.(ctx);
+    asrPaint(ctx);
+  });
+  const root = box("asr-panel",
+    field(options.languageLabel || "錄音語言", language),
+    field(options.textLabel || "參考逐字稿", text),
+    status, proposal, box("actions asr-actions", retry, apply),
+    ...(options.hint ? [hint(options.hint)] : []),
+  );
+  ctx.view = { root, text, language, status, proposal, retry, apply };
+  asrPaint(ctx);
+  if (ctx.reference && !ctx.requested && !ctx.text && !ctx.manual) recognizeReference(ctx);
+  return root;
+}
+
+let cleanASRReference = "";
+function drawCleanASR() {
+  const panel = $("clean-asr-work");
+  if (!panel) return;
+  const clip = cleanQueue.find(({ id }) => id === cleanASRReference);
+  if (!clip) {
+    cleanASRReference = "";
+    panel.replaceChildren();
+    return;
+  }
+  if (panel.dataset.reference === clip.id && panel.firstChild) return;
+  panel.dataset.reference = clip.id;
+  const ctx = asrContext("clean|" + clip.id, { reference: clip.id, language: "auto" });
+  panel.replaceChildren(el("h3", {}, "辨識：" + clip.name),
+    asrPanel("clean-asr", ctx, { hint: "逐字稿只供校對，不會改變清理或合併作業。" }));
+}
+
+const datasetMax = 24, datasetSeconds = 180;
+const datasetLanguages = Object.fromEntries(Object.entries(referenceLanguages).filter(([key]) => key !== "auto"));
+const datasetState = { clips: [], language: "yue", speaker: "", denoise: false, importing: false, submitting: false };
+let datasetHistoryTicket = 0;
+function datasetControls() {
+  const start = $("dataset-run");
+  if (!start) return;
+  const total = datasetState.clips.reduce((sum, { seconds }) => sum + (seconds || 0), 0);
+  const locked = datasetState.importing || datasetState.submitting;
+  const speaker = datasetState.speaker.trim();
+  const speakerInvalid = Array.from(speaker).length > 64 || /[|\p{Cc}]/u.test(speaker);
+  const busy = ["running", "cancelling"].includes(currentJob?.status);
+  start.disabled = locked || busy || !datasetState.clips.length || total > datasetSeconds || speakerInvalid;
+  $("dataset-files-input").disabled = locked || datasetState.clips.length >= datasetMax;
+  $("dataset-speaker").setAttribute("aria-invalid", String(speakerInvalid));
+  $("dataset-status").textContent = [
+    datasetState.clips.length + " / " + datasetMax + " 段 · " + total.toFixed(1) + " / " + datasetSeconds + " 秒",
+    speakerInvalid && "說話者名稱最多 64 字，不可包含直線符號或控制字元。",
+    datasetState.importing && "正在匯入所選錄音…",
+    datasetState.submitting && "正在提交…",
+    total > datasetSeconds && "總長度過長，請移除部份錄音。",
+  ].filter(Boolean).join("　");
+}
+function drawDatasetFiles() {
+  const list = $("dataset-files");
+  if (!list) return;
+  list.replaceChildren(...datasetState.clips.map((clip, i) =>
+    el("li", {}, box("actions",
+      el("span", { className: "file-name" }, clip.name + (Number.isFinite(clip.seconds) ? " · " + clip.seconds.toFixed(1) + " 秒" : "")),
+      btn("移除", () => {
+        if (datasetState.importing || datasetState.submitting) return;
+        datasetState.clips.splice(i, 1);
+        drawDatasetFiles();
+      }, { "aria-label": "移除訓練檔 " + clip.name, disabled: datasetState.importing || datasetState.submitting }),
+    )),
+  ));
+  datasetControls();
+}
+async function importDatasetClips(input) {
+  if (datasetState.importing || datasetState.submitting) return;
+  const files = Array.from(input.files);
+  if (!files.length) return;
+  input.value = "";
+  datasetState.importing = true;
+  drawDatasetFiles();
+  const messages = [];
+  try {
+    for (const file of files) {
+      if (datasetState.clips.length >= datasetMax) {
+        messages.push("只匯入上限以內的檔案；每次最多 24 段。");
+        break;
+      }
+      try {
+        const result = await api("reference", "POST", file);
+        if (!validRef(result.id)) throw Error("啟動器沒有回傳錄音編號。");
+        if (datasetState.clips.some((clip) => clip.id === result.id)) {
+          messages.push(file.name + " 與已選錄音相同，未重複加入。");
+        } else {
+          datasetState.clips.push({ id: result.id, name: file.name, seconds: result.seconds });
+        }
+      } catch (err) { messages.push(file.name + "：" + err.message); }
+    }
+  } finally {
+    datasetState.importing = false;
+    drawDatasetFiles();
+    if (messages.length && panel() === "training") notice(messages.join(" "));
+  }
+}
+async function submitDataset() {
+  const button = $("dataset-run");
+  if (!button || button.disabled) return;
+  datasetState.submitting = true;
+  drawDatasetFiles();
+  try {
+    currentJob = await api("datasets/auto", "POST", {
+      references: datasetState.clips.map(({ id }) => id),
+      language: datasetState.language,
+      speaker: datasetState.speaker.trim() || "speaker-1",
+      denoise: datasetState.denoise,
+    });
+    showJob();
+  } finally {
+    datasetState.submitting = false;
+    drawDatasetFiles();
+  }
+}
+async function loadDatasetHistory(mark = renderID) {
+  const element = $("dataset-history");
+  if (!element) return;
+  const ticket = ++datasetHistoryTicket;
+  const live = () => ticket === datasetHistoryTicket && mark === renderID && element.isConnected;
+  try {
+    const items = await api("datasets/auto");
+    if (!live()) return;
+    const cases = (items || []).filter((item) => /^[a-f0-9]{32}$/.test(item.id || ""));
+    element.replaceChildren(...(cases.length ? cases.map((item) => box("actions",
+      hint(item.speaker + " · " + item.count + " 段"),
+      el("a", { className: "linkbtn", href: "/api/datasets/auto/" + item.id + "/download", download: "" }, "下載資料集"),
+    )) : [hint("完成的資料集會在這裏顯示。")]));
+  } catch (e) {
+    if (live()) element.replaceChildren(hint("未能讀取資料集：" + e.message));
+  }
+}
+function autoDatasetPanel() {
+  const checkbox = el("input", {
+    type: "checkbox", id: "dataset-denoise", checked: datasetState.denoise,
+    onchange: (e) => { datasetState.denoise = e.target.checked; },
+  });
+  const section = card("一鍵建立訓練資料集",
+    hint("只會使用你在此明確選取的 WAV，不會加入目前參考錄音、聲音庫或舊作業。建立後仍需查閱與校對，不會自動開始訓練。"),
+    field("選取訓練 WAV（可選多個）", el("input", {
+      type: "file", accept: ".wav,audio/wav", multiple: true, id: "dataset-files-input",
+      onchange: (e) => importDatasetClips(e.target).catch(notice),
+    })),
+    el("ol", { id: "dataset-files", className: "dataset-files", "aria-label": "已選訓練錄音" }),
+    box("row",
+      field("訓練錄音語言", select(datasetLanguages, datasetState.language, (v) => { datasetState.language = v; }, "dataset-language")),
+      field("說話者（可選）", el("input", {
+        type: "text", id: "dataset-speaker", value: datasetState.speaker, placeholder: "speaker-1", maxLength: 128,
+        oninput: (e) => { datasetState.speaker = e.target.value; datasetControls(); },
+      })),
+    ),
+    el("label", { className: "dataset-option" }, checkbox, "切片前先做基礎去噪"),
+    el("p", { id: "dataset-status", className: "asr-status hint", role: "status" }),
+    btn("建立資料集", submitDataset, { id: "dataset-run", className: "primary", disabled: true }),
+    el("h3", {}, "已建立的資料集"),
+    el("div", { id: "dataset-history", "aria-live": "polite" }, hint("正在讀取資料集…")),
+  );
+  section.classList.add("dataset-auto");
+  return section;
+}
+
+
 function synthesis() {
   const k = draft.engine,
     settings = d(),
@@ -289,13 +917,22 @@ function synthesis() {
     onchange: async (e) => {
       const file = e.target.files[0];
       if (!file) return;
+      const upload = ++referenceMutation;
       try {
         const res = await api("reference", "POST", file);
+        if (upload !== referenceMutation || draft.engine !== k || panel() !== "synth" ||
+          !selectedMode(engines[k], settings.mode).reference) return;
+        const chosen = speakerASR(k, settings).language;
         replaceReference(res.id, file.name);
+        settings.refLang = chosen;
+        settings.refLangFor = res.id;
+        const asr = speakerASR(k, settings);
+        asr.language = chosen;
+        recognizeReference(asr);
         persist();
         render();
       } catch (err) {
-        notice(err);
+        if (upload === referenceMutation && draft.engine === k && panel() === "synth") notice(err);
       }
     },
   });
@@ -321,8 +958,11 @@ function synthesis() {
         draft.voiceId || "",
         (value) => {
           const voice = voices.find((item) => item.id === value);
-          if (voice) useVoice(voice);
-          else replaceReference("", "");
+          if (voice) {
+            useVoice(voice);
+            const asr = speakerASR(k, settings);
+            if (!asr.text && !asr.requested && !asr.manual) recognizeReference(asr);
+          } else replaceReference("", "");
           persist();
           render();
         },
@@ -343,22 +983,12 @@ function synthesis() {
         }),
       );
   }
-  if (mode.transcript)
-    right.push(
-      field(
-        "參考錄音原本說了甚麼？",
-        area(
-          "transcript",
-          referenceTranscript(settings) || "",
-          "填寫錄音中的實際對白",
-          (v) => {
-            settings.transcriptFor = draft.reference;
-            settings.transcriptVoice = draft.voiceId || "";
-            update("transcript", v);
-          },
-        ),
-      ),
-    );
+  if (mode.reference)
+    right.push(asrPanel("reference-asr", speakerASR(k, settings), {
+      textID: "transcript", languageID: "refLang",
+      textLabel: "參考逐字稿",
+      hint: mode.transcript ? "" : "此模式只用參考音訊；逐字稿只供查看與校對。",
+    }));
   if (mode.instruction || mode.style)
     right.push(
       field(
@@ -395,19 +1025,6 @@ function synthesis() {
             "language",
           ),
         ),
-        ...(k === "gpt-sovits" ? [field(
-          "錄音語言",
-          select(
-            referenceLanguages,
-            (settings.refLangFor === draft.reference ? settings.refLang : selectedVoice()?.language) ||
-              settings.refLang || "yue",
-            (v) => {
-              settings.refLangFor = draft.reference;
-              update("refLang", v);
-            },
-            "refLang",
-          ),
-        )] : []),
       ),
     );
   }
@@ -435,12 +1052,21 @@ function emotionFields(kind, settings, update) {
       onchange: async (event) => {
         const file = event.target.files[0];
         if (!file) return;
+        const upload = ++emotionUploadTicket;
         try {
           const ref = await api("reference", "POST", file);
+          if (upload !== emotionUploadTicket || draft.engine !== "indextts2" || panel() !== "synth" ||
+            selectedMode(engines.indextts2, settings.mode).emotion !== "audio") return;
+          const language = emotionASR(settings).language;
           update("emotionReference", ref.id);
           update("emotionName", file.name);
+          const asr = emotionASR(settings);
+          asr.language = language;
+          recognizeReference(asr);
           render();
-        } catch (err) { notice(err); }
+        } catch (err) {
+          if (upload === emotionUploadTicket && draft.engine === "indextts2" && panel() === "synth") notice(err);
+        }
       },
     });
     fields.push(field("情緒參考錄音（WAV，最多 15 秒）", input));
@@ -448,6 +1074,10 @@ function emotionFields(kind, settings, update) {
       hint(settings.emotionName || "已匯入情緒錄音"),
       el("audio", { controls: true, preload: "none", src: "/api/reference/" + settings.emotionReference }),
     );
+    fields.push(asrPanel("emotion-asr", emotionASR(settings), {
+      languageLabel: "情緒錄音語言", textLabel: "情緒錄音逐字稿",
+      hint: "只供查看與校對，不會送入情緒合成。",
+    }));
   }
   if (kind === "vector") {
     const weights = settings.emotionWeights || Array(8).fill(0);
@@ -474,13 +1104,12 @@ async function submit(preview) {
     engine: k,
     mode: mode.id,
     text: draft.text || "",
-    transcript: mode.transcript ? referenceTranscript(s) || "" : "",
+    ...(mode.transcript ? { transcript: speakerASR(k, s).text } : {}),
     instruction: mode.instruction || mode.style ? s.instructions?.[mode.id] ?? s.instruction ?? "" : "",
     reference: mode.reference ? draft.reference || "" : "",
     voiceId: mode.reference ? draft.voiceId || "" : "",
     language: engine.languageOptions?.includes(s.language) ? s.language : engine.languageOptions?.[0] || "yue",
-    refLang: (s.refLangFor === draft.reference ? s.refLang : selectedVoice()?.language) ||
-      s.refLang || "yue",
+    ...(k === "gpt-sovits" && mode.reference ? { refLang: speakerASR(k, s).language } : {}),
     speed: engine.speed ? s.speed || 1 : 1,
     preview,
   };
@@ -501,8 +1130,8 @@ function voiceLibrary() {
       editingVoice = {
         name: "",
         reference: draft.reference || "",
-        transcript: referenceTranscript(d()) || "",
-        language: selectedVoice()?.language || d().refLang || "yue",
+        transcript: speakerASR(draft.engine, d()).text,
+        language: speakerASR(draft.engine, d()).language,
       };
       render();
     }, { className: "primary" }),
@@ -531,12 +1160,17 @@ function voiceLibrary() {
     onchange: async (event) => {
       const file = event.target.files[0];
       if (!file) return;
+      const upload = ++voiceUploadTicket;
       try {
         const ref = await api("reference", "POST", file);
+        if (upload !== voiceUploadTicket || editingVoice !== voice || panel() !== "voices") return;
         if (ref.id !== voice.reference) voice.transcript = "";
         voice.reference = ref.id;
-        if (editingVoice === voice && panel() === "voices") render();
-      } catch (err) { notice(err); }
+        recognizeReference(profileASR(voice));
+        render();
+      } catch (err) {
+        if (upload === voiceUploadTicket && editingVoice === voice && panel() === "voices") notice(err);
+      }
     },
   });
   const edit = card(
@@ -549,9 +1183,7 @@ function voiceLibrary() {
     ...(voice.reference ? [el("audio", {
       controls: true, preload: "metadata", src: "/api/reference/" + voice.reference,
     })] : []),
-    field("錄音語言", select(referenceLanguages, voice.language, (value) => { voice.language = value; }, "voice-language")),
-    field("參考逐字稿", area("voice-transcript", voice.transcript, "填寫錄音中的實際對白",
-      (value) => { voice.transcript = value; })),
+    asrPanel("voice", profileASR(voice)),
     field("GPT-SoVITS 模型", select(
       modelOptions("v2Pro 基礎模型", voice.modelProject), voice.modelProject || "",
       (id) => { voice.modelProject = id; }, "voice-trained-model",
@@ -586,7 +1218,10 @@ function voiceLibrary() {
 }
 async function training() {
   const mark = renderID;
-  $("work").replaceChildren(hint("正在讀取訓練專案…"));
+  const manual = box("training-manual", hint("正在讀取訓練專案…"));
+  $("work").replaceChildren(autoDatasetPanel(), manual);
+  drawDatasetFiles();
+  loadDatasetHistory(mark);
   try {
     const projects = await api("training");
     if (mark !== renderID) return;
@@ -602,7 +1237,7 @@ async function training() {
       }, { className: "primary" }),
     );
     if (!trainingProject) {
-      $("work").replaceChildren(projectsCard);
+      manual.replaceChildren(projectsCard);
       return;
     }
     const project = trainingProject;
@@ -660,7 +1295,7 @@ async function training() {
         }),
       );
     }
-    $("work").replaceChildren(box("grid", projectsCard, editor));
+    manual.replaceChildren(box("grid", projectsCard, editor));
   } catch (err) {
     if (mark === renderID) notice(err);
   }
@@ -1015,16 +1650,24 @@ async function history() {
     if (mark === renderID) notice(e);
   }
 }
+function syncSynthesisControls() {
+  const buttons = document.querySelectorAll(".run");
+  if (!buttons.length) return;
+  const engine = engines[draft.engine], mode = selectedMode(engine, d().mode);
+  const busy = ["running", "cancelling"].includes(currentJob?.status);
+  const asr = mode.transcript ? speakerASR(draft.engine, d()) : null;
+  const waiting = asr?.pending && !asr.text;
+  buttons.forEach((button) => { button.disabled = busy || !canRun(engine, mode) || waiting; });
+}
 function showJob() {
   const j = currentJob,
     busy = j && ["running", "cancelling"].includes(j.status);
-  document.querySelectorAll(".run").forEach((b) => {
-    const engine = engines[draft.engine];
-    b.disabled = !!busy || !canRun(engine, selectedMode(engine, d().mode));
-  });
-  const panel = $("job");
+  syncSynthesisControls();
+  cleanStatus();
+  datasetControls();
+  const jobPanel = $("job");
   if (!j) {
-    panel.replaceChildren();
+    jobPanel.replaceChildren();
     return;
   }
   const states = {
@@ -1035,9 +1678,9 @@ function showJob() {
     failed: "失敗",
   };
   const nodes = [
-    catalog[j.engine][0] +
+    (j.kind === "clean" ? cleanWorkspace[0] : catalog[j.engine]?.[0] || "工作室") +
       " · " +
-      ({ install: "安裝", synthesis: "語音合成", transcription: "素材轉錄" }[j.kind] || j.kind) +
+      ({ install: "安裝", synthesis: "語音合成", transcription: "素材轉錄", clean: "音檔清理", dataset: "建立訓練資料集" }[j.kind] || j.kind) +
       " · " +
       states[j.status],
   ];
@@ -1055,9 +1698,16 @@ function showJob() {
     );
   if (j.kind === "synthesis" && j.status === "done" && d().tab !== "history")
     nodes.push(btn("試聽及匯出", () => setTab("history")));
-  if (j.kind === "transcription" && j.status === "done" && panel() === "training")
+  if (j.kind === "clean" && j.status === "done" && !cleanOpen)
+    nodes.push(btn("查看清理結果", () => setEngine("clean")));
+  if (j.kind === "dataset" && j.status === "done" && panel() !== "training")
+    nodes.push(btn("查看資料集", () => {
+      draft.engine = "gpt-sovits";
+      setTab("training");
+    }));
+  if (j.kind === "transcription" && j.status === "done" && !cleanOpen && d().tab === "training")
     nodes.push("　重新選取專案以查看建議逐字稿。");
-  panel.replaceChildren(...nodes);
+  jobPanel.replaceChildren(...nodes);
 }
 async function poll() {
   try {
@@ -1069,6 +1719,8 @@ async function poll() {
         render();
       } else {
         showJob();
+        if (j?.status === "done" && j.kind === "clean" && cleanOpen) loadCleanHistory();
+        if (j?.status === "done" && j.kind === "dataset" && panel() === "training") loadDatasetHistory();
         if (j?.status === "done" && panel() === "history") history();
       }
     }
@@ -1087,7 +1739,7 @@ async function poll() {
     if (draft.voiceId && !selectedVoice()) delete draft.voiceId;
     draft.drafts ||= {};
     if (!catalog[draft.engine]) draft.engine = "gpt-sovits";
-    for (const [k, v] of Object.entries(catalog))
+    for (const [k, v] of Object.entries(workspaces))
       $("compact").add(new Option(v[0], k));
     $("compact").onchange = (e) => setEngine(e.target.value);
     document.addEventListener("visibilitychange", () => {

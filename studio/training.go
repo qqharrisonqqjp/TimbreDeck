@@ -452,7 +452,9 @@ func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if !filepath.IsAbs(model) || len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
+	if strings.TrimSpace(in.ModelPath) == "" && len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
+		model = "" // No legacy model configured: use the bundled shared recognizers.
+	} else if !filepath.IsAbs(model) || len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
 		fail(w, 422, "請輸入完整的本機 faster-whisper 模型資料夾路徑。")
 		return
 	}
@@ -493,36 +495,59 @@ func (s *studio) transcribe(ctx context.Context, jobID, engine, model string, pr
 		}
 		clips = append(clips, input{ID: clip.ID, Path: path, Language: clip.Language})
 	}
-	output := filepath.Join(temp, "transcripts.json")
-	payload, err := json.Marshal(map[string]any{"clips": clips, "model": model, "output": output})
-	if err != nil {
-		return err
-	}
-	script, err := assets.ReadFile("transcribe.py")
-	if err != nil {
-		return err
-	}
-	logFile, err := os.Create(s.path("logs", jobID+".log"))
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	python := filepath.Join(engine, "runtime", "python.exe")
-	cmd := exec.CommandContext(ctx, python, "-c", string(script))
-	cmd.Dir = engine
-	cmd.Stdin = strings.NewReader(string(payload))
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.Env = append(cmd.Environ(), "PYTHONUTF8=1", "PYTHONNOUSERSITE=1", "HF_HUB_OFFLINE=1",
-		"PATH="+filepath.Dir(python)+string(os.PathListSeparator)+engine+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("轉錄失敗。請查看 logs/%s.log（%v）。", jobID, err)
-	}
 	transcripts := map[string]string{}
-	if err := readJSON(output, &transcripts); err != nil {
-		return err
+	if model == "" {
+		groups := make(map[string][]input)
+		for _, c := range clips {
+			groups[c.Language] = append(groups[c.Language], c)
+		}
+		for lang, group := range groups {
+			var names []string
+			for _, c := range group {
+				names = append(names, c.Path)
+			}
+			results, err := s.recognizeFiles(ctx, names, lang)
+			if err != nil {
+				return err
+			}
+			if len(results) != len(group) {
+				return errors.New("轉錄輸出數量不符。")
+			}
+			for i, c := range group {
+				transcripts[c.ID] = results[i].Text
+			}
+		}
+	} else {
+		output := filepath.Join(temp, "transcripts.json")
+		payload, err := json.Marshal(map[string]any{"clips": clips, "model": model, "output": output})
+		if err != nil {
+			return err
+		}
+		script, err := assets.ReadFile("transcribe.py")
+		if err != nil {
+			return err
+		}
+		logFile, err := os.Create(s.path("logs", jobID+".log"))
+		if err != nil {
+			return err
+		}
+		defer logFile.Close()
+		python := filepath.Join(engine, "runtime", "python.exe")
+		cmd := exec.CommandContext(ctx, python, "-c", string(script))
+		cmd.Dir = engine
+		cmd.Stdin = strings.NewReader(string(payload))
+		cmd.Stdout, cmd.Stderr = logFile, logFile
+		cmd.Env = append(cmd.Environ(), "PYTHONUTF8=1", "PYTHONNOUSERSITE=1", "HF_HUB_OFFLINE=1",
+			"PATH="+filepath.Dir(python)+string(os.PathListSeparator)+engine+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("轉錄失敗。請查看 logs/%s.log（%v）。", jobID, err)
+		}
+		if err := readJSON(output, &transcripts); err != nil {
+			return err
+		}
 	}
 	s.files.Lock()
 	defer s.files.Unlock()

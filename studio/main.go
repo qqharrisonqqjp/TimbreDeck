@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,10 +29,11 @@ import (
 var assets embed.FS
 
 type studio struct {
-	root   string
-	mu     sync.Mutex
-	active *job
-	cancel context.CancelFunc
+	root     string
+	instance string
+	mu       sync.Mutex
+	active   *job
+	cancel   context.CancelFunc
 	// Serializes settings writes, including updates from the pack installer.
 	files sync.Mutex
 }
@@ -127,7 +129,7 @@ func openStudio(root string) (*studio, error) {
 	if e = os.MkdirAll(filepath.Join(abs, "voices", "profiles"), 0700); e != nil {
 		return nil, e
 	}
-	return &studio{root: abs}, nil
+	return &studio{root: abs, instance: id()}, nil
 }
 func (s *studio) path(parts ...string) string { return filepath.Join(s.root, filepath.Join(parts...)) }
 func (s *studio) paths() (map[string]string, error) {
@@ -349,6 +351,9 @@ func (s *studio) detail(msg string) { s.mu.Lock(); defer s.mu.Unlock(); s.active
 func (s *studio) finish(e error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.finishLocked(e)
+}
+func (s *studio) finishLocked(e error) {
 	s.cancel()
 	s.cancel = nil
 	switch {
@@ -365,10 +370,15 @@ func (s *studio) finish(e error) {
 }
 func (s *studio) routes(host string) http.Handler {
 	m := http.NewServeMux()
+	m.HandleFunc("GET /api/agent/info", s.agentInfo)
 	m.HandleFunc("GET /api/state", s.config)
 	m.HandleFunc("PUT /api/draft", s.config)
 	m.HandleFunc("POST /api/engine", s.setPath)
 	m.HandleFunc("POST /api/reference", s.reference)
+	m.HandleFunc("POST /api/asr", s.asrHandler)
+	m.HandleFunc("POST /api/datasets/auto", s.startAutoDataset)
+	m.HandleFunc("GET /api/datasets/auto", s.autoDatasetHistory)
+	m.HandleFunc("GET /api/datasets/auto/{id}/download", s.downloadAutoDataset)
 	m.HandleFunc("GET /api/profiles", s.profiles)
 	m.HandleFunc("POST /api/profiles", s.saveProfile)
 	m.HandleFunc("PUT /api/profiles/{id}", s.saveProfile)
@@ -383,6 +393,9 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("GET /api/trained-models", s.trainedModels)
 	m.HandleFunc("DELETE /api/trained-models/{id}", s.removeTrainedModel)
 	m.HandleFunc("POST /api/synthesize", s.synthesize)
+	m.HandleFunc("POST /api/clean", s.clean)
+	m.HandleFunc("GET /api/clean/history", s.cleanHistory)
+	m.HandleFunc("GET /api/clean/audio/{id}", s.cleanAudio)
 	m.HandleFunc("GET /api/history", s.history)
 	m.HandleFunc("DELETE /api/audio/{id}", s.removeOutputAudio)
 	m.HandleFunc("GET /api/unused-recordings", s.listUnusedRecordings)
@@ -416,6 +429,10 @@ func (s *studio) routes(host string) http.Handler {
 			http.Error(w, "Local access only", 403)
 			return
 		}
+		if instance := r.Header.Get("X-TimbreDeck-Agent-Instance"); instance != "" && instance != s.instance {
+			fail(w, 409, "工作室已重新啟動，請重新連接。")
+			return
+		}
 		if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("X-TimbreDeck") != "1" {
 			fail(w, 403, "請在本機工作室操作。")
 			return
@@ -433,6 +450,7 @@ func main() {
 	}
 	root := flag.String("data", filepath.Dir(exe), "portable workspace")
 	headless := flag.Bool("no-browser", false, "print local URL without opening a browser")
+	idleTTL := flag.Duration("agent-idle", 0, "optional idle lifetime for a headless agent service")
 	flag.Parse()
 	s, e := openStudio(*root)
 	if e != nil {
@@ -440,30 +458,57 @@ func main() {
 	}
 	lock, e := lockWorkspace(s.path("config", "studio.lock"))
 	if e != nil {
+		if found := s.runningAgentSession(); found != "" {
+			fmt.Println("TimbreDeck 聲台", found)
+			if !*headless {
+				launchUI(found)
+			}
+			return
+		}
 		log.Fatal("無法鎖定工作資料夾，請確認聲台未在執行，並檢查寫入權限。 ", e)
 	}
 	defer lock.Close()
+	s.pruneAutoDatasetStaging()
+	if err := s.pruneCleanStaging(); err != nil {
+		log.Print("未能清理上次去噪暫存：", err)
+	}
 	l, e := net.Listen("tcp4", "127.0.0.1:0")
 	if e != nil {
 		log.Fatal(e)
 	}
 	url := "http://" + l.Addr().String()
+	if err := writeJSON(s.path("cache", "agent-session.json"), agentSession{URL: url, Instance: s.instance, PID: os.Getpid()}); err != nil {
+		log.Print("AI session discovery: ", err)
+	}
+	defer os.Remove(s.path("cache", "agent-session.json"))
 	fmt.Println("TimbreDeck 聲台", url)
 	fmt.Println("請保留此視窗。按 Ctrl+C 結束工作室。")
 	if !*headless {
-		var cmd *exec.Cmd
-		if runtime.GOOS == "windows" {
-			cmd = exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url)
-		} else {
-			cmd = exec.Command("xdg-open", url)
-		}
-		if e = cmd.Start(); e != nil {
-			log.Print(e)
-		} else {
-			go cmd.Wait()
-		}
+		launchUI(url)
 	}
-	srv := &http.Server{Handler: s.routes(l.Addr().String()), ReadHeaderTimeout: 10 * time.Second}
+	mux := s.routes(l.Addr().String())
+	var last, inflight atomic.Int64
+	last.Store(time.Now().UnixNano())
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inflight.Add(1)
+		defer func() { last.Store(time.Now().UnixNano()); inflight.Add(-1) }()
+		mux.ServeHTTP(w, r)
+	}), ReadHeaderTimeout: 10 * time.Second}
+	if *headless && *idleTTL > 0 {
+		go func() {
+			t := time.NewTicker(min(30*time.Second, *idleTTL))
+			defer t.Stop()
+			for range t.C {
+				s.mu.Lock()
+				idle := inflight.Load() == 0 && !s.busy() && len(asrActive) == 0 && time.Since(time.Unix(0, last.Load())) >= *idleTTL
+				s.mu.Unlock()
+				if idle {
+					_ = srv.Shutdown(context.Background())
+					return
+				}
+			}
+		}()
+	}
 	sig, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go func() {
@@ -477,5 +522,19 @@ func main() {
 	}()
 	if e = srv.Serve(l); e != nil && e != http.ErrServerClosed {
 		log.Fatal(e)
+	}
+}
+
+func launchUI(url string) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url)
+	} else {
+		cmd = exec.Command("xdg-open", url)
+	}
+	if e := cmd.Start(); e != nil {
+		log.Print(e)
+	} else {
+		go cmd.Wait()
 	}
 }

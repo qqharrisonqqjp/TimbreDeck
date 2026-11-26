@@ -18,6 +18,21 @@ STAGES = (
     "3-get-semantic.py",
 )
 
+# An embedded Windows runtime with pythonXY._pth ignores PYTHONPATH. Add
+# the pinned engine's import roots inside that interpreter instead.
+STAGE_LAUNCHER = """\
+import os
+import runpy
+import sys
+
+script, engine = sys.argv[1:3]
+gpt = os.path.join(engine, "GPT_SoVITS")
+sys.path[:0] = [gpt, engine, os.path.join(gpt, "eres2net")]
+sys.dont_write_bytecode = True
+sys.argv = [script]
+runpy.run_path(script, run_name="__main__")
+"""
+
 
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -71,21 +86,29 @@ def prepare(engine, dataset, output, gpu, model_root=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".gpt-prepare-", dir=output.parent) as temporary:
         run = Path(temporary) / "features"
+        scratch = Path(temporary) / "scratch"
         run.mkdir()
+        scratch.mkdir()
         env = dict(os.environ, inp_text=str(list_path), inp_wav_dir=str(dataset / "wavs"),
                    exp_name="timbredeck", opt_dir=str(run), i_part="0", all_parts="1",
                    _CUDA_VISIBLE_DEVICES=gpu or "", CUDA_VISIBLE_DEVICES=gpu or "",
-                   is_half="False", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                   version="v2Pro", is_half="False", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                    PYTHONUTF8="1", PYTHONNOUSERSITE="1",
+                   NUMBA_CACHE_DIR=str(scratch / "numba"),
                    bert_pretrained_dir=str(weights / "chinese-roberta-wwm-ext-large"),
                    cnhubert_base_dir=str(weights / "chinese-hubert-base"),
                    sv_path=str(weights / "sv" / "pretrained_eres2netv2w24s4ep4.ckpt"),
                    pretrained_s2G=str(weights / "v2Pro" / "s2Gv2Pro.pth"),
                    s2config_path=str(config),
                    PATH=os.pathsep.join((str(python.parent), str(engine), os.environ.get("PATH", ""))))
+        env.setdefault("OMP_NUM_THREADS", "4")
+        env.setdefault("MKL_NUM_THREADS", "4")
         for script in scripts:
             print(script.name, flush=True)
-            subprocess.run([str(python), "-s", str(script)], cwd=engine, env=env, check=True)
+            result = subprocess.run([str(python), "-s", "-c", STAGE_LAUNCHER, str(script), str(engine)],
+                                    cwd=scratch, env=env, check=False)
+            if result.returncode:
+                raise ValueError(f"{script.name} failed (exit {result.returncode})")
         text = check_rows(run / "2-name2text-0.txt", paths)
         semantic_header = "item_name\tsemantic_audio"
         semantic = check_rows(run / "6-name2semantic-0.tsv", paths, semantic_header)
