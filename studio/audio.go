@@ -165,15 +165,19 @@ func (s *studio) referenceAudio(w http.ResponseWriter, r *http.Request) {
 }
 
 type request struct {
-	Engine           string    `json:"engine"`
-	Mode             string    `json:"mode"`
-	Text             string    `json:"text"`
-	Transcript       string    `json:"transcript"`
-	Instruction      string    `json:"instruction"`
-	Reference        string    `json:"reference"`
+	Engine           string `json:"engine"`
+	Mode             string `json:"mode"`
+	Text             string `json:"text"`
+	Transcript       string `json:"transcript"`
+	Instruction      string `json:"instruction"`
+	Reference        string `json:"reference"`
+	SourceSpeech     string `json:"sourceSpeech,omitempty"`
+	STSStreaming     bool   `json:"stsStreaming,omitempty"`
+	ttsResident      *ttsTarget
 	VoiceID          string    `json:"voiceId,omitempty"`
 	Variant          string    `json:"variant,omitempty"`
 	ModelProject     string    `json:"modelProject,omitempty"`
+	UseBaseModel     bool      `json:"useBaseModel,omitempty"`
 	Speaker          string    `json:"speaker,omitempty"`
 	EmotionReference string    `json:"emotionReference,omitempty"`
 	EmotionStrength  *float64  `json:"emotionStrength,omitempty"`
@@ -187,18 +191,21 @@ type request struct {
 	SplitSeparate    bool      `json:"splitSeparate,omitempty"`
 }
 type recording struct {
-	ID             string    `json:"id"`
-	Created        time.Time `json:"created"`
-	Seconds        float64   `json:"seconds"`
-	Input          request   `json:"input"`
-	VoiceName      string    `json:"voiceName,omitempty"`
-	SampleRate     uint32    `json:"sampleRate,omitempty"`
-	Model          string    `json:"model,omitempty"`
-	PackVersion    string    `json:"packVersion,omitempty"`
-	RuntimeVersion string    `json:"runtimeVersion,omitempty"`
-	AudioAvailable bool      `json:"audioAvailable"`
-	VerifiedCUDA   string    `json:"verifiedCuda,omitempty"`
-	Parts          int       `json:"parts,omitempty"`
+	ID             string            `json:"id"`
+	Created        time.Time         `json:"created"`
+	Seconds        float64           `json:"seconds"`
+	Input          request           `json:"input"`
+	VoiceName      string            `json:"voiceName,omitempty"`
+	SampleRate     uint32            `json:"sampleRate,omitempty"`
+	Model          string            `json:"model,omitempty"`
+	FineTuneName   string            `json:"fineTuneName,omitempty"`
+	PackVersion    string            `json:"packVersion,omitempty"`
+	RuntimeVersion string            `json:"runtimeVersion,omitempty"`
+	AudioAvailable bool              `json:"audioAvailable"`
+	VerifiedCUDA   string            `json:"verifiedCuda,omitempty"`
+	Parts          int               `json:"parts,omitempty"`
+	PartsAvailable bool              `json:"partsAvailable,omitempty"`
+	Timing         *generationTiming `json:"timing,omitempty"`
 }
 
 func firstSentence(s string) string {
@@ -213,6 +220,9 @@ func language(s string) bool {
 	return s == "yue" || s == "zh" || s == "en" || s == "ja" || s == "ko" || s == "auto"
 }
 func (s *studio) validate(q *request) error {
+	if q.SourceSpeech != "" {
+		return errors.New("請使用 STS 工作區轉換來源錄音。")
+	}
 	q.Text = strings.TrimSpace(q.Text)
 	q.Transcript = strings.TrimSpace(q.Transcript)
 	q.Instruction = strings.TrimSpace(q.Instruction)
@@ -346,6 +356,10 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 			fail(w, 422, "微調模型只適用於 GPT-SoVITS。")
 			return
 		}
+		if q.Variant != "v2Pro" {
+			fail(w, 422, "此套微調模型需要 GPT-SoVITS v2Pro。")
+			return
+		}
 		model, err := s.loadTrainedModel(q.ModelProject)
 		if err != nil {
 			fail(w, 422, "找不到可用的 v2Pro 微調模型，請重新偵測。")
@@ -370,11 +384,25 @@ func (s *studio) synthesize(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, "請先在模型管理連接 "+q.Variant+" 模型。")
 		return
 	}
+	if p := s.residentLocked(); p != nil && p.pinned {
+		t, err := newTTSTarget(q, root, v.modelPaths[q.Variant], trained)
+		if err != nil || p.tts == nil || p.key != t.token {
+			fail(w, 409, "已有其他常駐模型，請先停止或確認切換。")
+			return
+		}
+		q.ttsResident = t
+	} else if p != nil {
+		s.stopSTSWorkerLocked()
+	}
 	ctx, j, _ := s.reserveLocked(q.Engine, "synthesis")
 	go func() { s.finish(s.render(ctx, j.ID, root, v.modelPaths[q.Variant], q, voice, trained)) }()
 	send(w, 202, j)
 }
 func (s *studio) render(ctx context.Context, key, root, modelRoot string, q request, voice string, trained *trainedModel) error {
+	return s.renderWithStream(ctx, key, root, modelRoot, q, voice, trained, nil)
+}
+func (s *studio) renderWithStream(ctx context.Context, key, root, modelRoot string, q request, voice string, trained *trainedModel, stream *stsPreview) error {
+	started := time.Now()
 	dir, e := os.MkdirTemp(s.path("outputs"), ".render-*")
 	if e != nil {
 		return e
@@ -402,6 +430,23 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 	if q.SplitAt > 0 && !q.Preview {
 		parts = splitSynthesis(q.Text, q.SplitAt)
 	}
+	// Use the same Python process and loaded model for all segments of an
+	// ordinary job. Explicitly pinned models still survive the job.
+	if stream == nil && len(parts) > 1 && q.ttsResident == nil {
+		target, err := newTTSTarget(q, root, modelRoot, trained)
+		if err != nil {
+			return err
+		}
+		q.ttsResident = target
+		defer func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if p := s.stsWorker; p != nil && !p.pinned && p.key == target.token {
+				s.stopSTSWorkerLocked()
+				fmt.Fprintln(logFile, "Split worker released after the job:", p.log)
+			}
+		}()
+	}
 	diag := filepath.Join(dir, "execution.json")
 	var outcome []executionEvidence
 	var waves []string
@@ -424,6 +469,12 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 			"trained":     trained,
 			"modelRoot":   splitRoot,
 			"diagnostics": pdiag,
+			"sourceSpeech": func() string {
+				if q.SourceSpeech == "" {
+					return ""
+				}
+				return s.path("voices", q.SourceSpeech+".wav")
+			}(),
 		})
 		if e != nil {
 			return e
@@ -433,10 +484,21 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 		cmd.Dir = root
 		cmd.Stdin = strings.NewReader(string(payload))
 		cmd.Stdout = logFile
+		if stream != nil {
+			cmd.Stdout = stream
+		}
 		cmd.Stderr = logFile
-		env := cmd.Environ()
-		cmd.Env = append(env, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8", "PYTHONNOUSERSITE=1", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "HF_HOME="+s.path("cache", "huggingface"), "TORCH_HOME="+s.path("cache", "torch"), "PATH="+filepath.Dir(py)+string(os.PathListSeparator)+root+string(os.PathListSeparator)+os.Getenv("PATH"))
-		if e = cmd.Run(); e != nil {
+		cmd.Env = synthesisEnv(cmd, s.path("cache"), root)
+		if stream != nil && q.Engine != defaultSTS {
+			e = s.runExternalSTS(ctx, root, q.Engine, payload, stream, logFile)
+		} else if stream != nil {
+			e = s.runSTSWorker(ctx, root, modelRoot, src, cmd.Env, payload, stream, logFile)
+		} else if q.ttsResident != nil {
+			e = s.runTTSProcess(ctx, q.ttsResident, payload, key, logFile)
+		} else {
+			e = cmd.Run()
+		}
+		if e != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -474,7 +536,15 @@ func (s *studio) render(ctx context.Context, key, root, modelRoot string, q requ
 	}
 	diagnostics := outcome[0]
 	record := recording{ID: key, Created: time.Now().UTC(), Seconds: secs, Input: q, VoiceName: voice,
-		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: !q.SplitSeparate}
+		SampleRate: rate, Model: diagnostics.Model, AudioAvailable: !q.SplitSeparate,
+		Timing: summarizeTiming(outcome, time.Since(started).Seconds())}
+	if trained != nil {
+		record.FineTuneName = trained.Name
+		if record.FineTuneName == "" {
+			project, _ := s.loadTraining(q.ModelProject)
+			record.FineTuneName = project.Name
+		}
+	}
 	if q.SplitSeparate {
 		record.Parts = len(parts)
 	}
@@ -516,21 +586,34 @@ func (s *studio) history(w http.ResponseWriter, r *http.Request) {
 		if !d.IsDir() || !hexID(d.Name(), 32) {
 			continue
 		}
-		var v recording
-		if readJSON(s.path("outputs", d.Name(), "record.json"), &v) == nil && v.ID == d.Name() {
-			// Old records remain untouched. Read their sidecar when available.
-			if v.VerifiedCUDA == "" {
-				var x executionEvidence
-				if readJSON(s.path("outputs", d.Name(), "execution.json"), &x) == nil {
-					v.VerifiedCUDA = x.verifiedDevice(v)
-				}
-			}
-			v.AudioAvailable = installedFile(s.path("outputs", d.Name(), "speech.wav"))
-			items = append(items, v)
+		if row, ok := s.outputRecord(d.Name()); ok {
+			items = append(items, row)
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Created.After(items[j].Created) })
 	send(w, 200, items)
+}
+func (s *studio) outputRecord(key string) (recording, bool) {
+	var row recording
+	if !hexID(key, 32) || readJSON(s.path("outputs", key, "record.json"), &row) != nil || row.ID != key {
+		return row, false
+	}
+	if row.VerifiedCUDA == "" {
+		var result executionEvidence
+		if readJSON(s.path("outputs", key, "execution.json"), &result) == nil {
+			row.VerifiedCUDA = result.verifiedDevice(row)
+		}
+	}
+	row.AudioAvailable = installedFile(s.path("outputs", key, "speech.wav"))
+	row.PartsAvailable = installedFile(s.path("outputs", key, "parts.zip"))
+	return row, true
+}
+func (s *studio) historyItem(w http.ResponseWriter, r *http.Request) {
+	if row, ok := s.outputRecord(r.PathValue("id")); ok {
+		send(w, 200, row)
+		return
+	}
+	fail(w, 404, "找不到輸出紀錄。")
 }
 func (s *studio) audio(w http.ResponseWriter, r *http.Request) {
 	k := r.PathValue("id")

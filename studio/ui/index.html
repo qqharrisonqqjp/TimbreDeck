@@ -5,40 +5,60 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>TimbreDeck 聲台</title>
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/workstation.css" />
     <link rel="icon" href="/mark.svg" />
+    <script defer src="/sts-mic.js"></script>
     <script defer src="/app.js"></script>
+    <script defer src="/training.js"></script>
+    <script defer src="/training-drafts.js"></script>
+    <script defer src="/history.js"></script>
+    <script defer src="/arena.js"></script>
+    <script defer src="/shell.js"></script>
+    <script defer src="/start.js"></script>
   </head>
   <body>
     <header>
       <div class="top">
+        <button id="nav-toggle" type="button" aria-controls="sidebar" aria-expanded="false">工作區 ☰</button>
         <div class="brand">
           <span class="mark" aria-hidden="true">▮▥</span>TimbreDeck
           <small>聲台</small>
         </div>
         <button id="engine-open" type="button" aria-haspopup="dialog">選擇引擎</button>
-        <select id="compact" aria-label="切換引擎"></select>
       </div>
     </header>
     <dialog id="engine-dialog" aria-labelledby="engine-dialog-name">
       <div class="row"><h2 id="engine-dialog-name">選擇合成引擎</h2><form method="dialog"><button type="submit">關閉</button></form></div>
       <nav id="switcher" aria-label="引擎切換"></nav>
     </dialog>
+    <dialog id="studio-exit-dialog" class="studio-dialog" aria-labelledby="exit-title" aria-describedby="exit-description">
+      <h2 id="exit-title">結束 TimbreDeck？</h2>
+      <p id="exit-description">會結束所有分頁共用嘅本機工作室，並卸載常駐模型。已儲存嘅資料會保留；如有其他分頁，請先儲存入面嘅改動。</p>
+      <p id="exit-feedback" role="status"></p>
+      <form method="dialog" class="actions">
+        <button id="exit-cancel" type="submit" autofocus>返回工作室</button>
+        <button id="exit-confirm" type="button" class="primary">結束工作室</button>
+      </form>
+    </dialog>
     <div class="shell">
-    <aside><nav id="sections" aria-label="聲台工作區"></nav></aside>
-    <main>
-      <div class="headline">
+    <aside id="sidebar"><nav id="sections" aria-label="聲台工作區"></nav></aside>
+    <main id="main-content">
+      <div class="headline studio-hero">
+        <div id="hero-depth" aria-hidden="true"></div>
         <div>
-          <h1 id="title"></h1>
+          <h1 id="title" tabindex="-1"></h1>
           <p id="subtitle"></p>
         </div>
         <span id="state" class="state"></span>
       </div>
-      <nav id="tabs" aria-label="工作模式"></nav>
-      <div id="job" role="status"></div>
       <div id="notice" role="status"></div>
       <section id="work"></section>
       <p id="saved" role="status"></p>
     </main>
     </div>
+    <section id="activity" aria-label="作業同播放">
+      <div id="job"></div>
+      <div id="mini-player" hidden><strong id="mini-title"></strong><audio id="mini-audio" controls preload="none"></audio><button type="button" id="mini-close">停止試聽</button></div>
+    </section>
   </body>
 </html>

@@ -71,6 +71,7 @@ func (s *studio) unusedReferences() ([]unusedReference, error) {
 				return nil, err
 			}
 			used[record.Input.Reference] = true
+			used[record.Input.SourceSpeech] = true
 			used[record.Input.EmotionReference] = true
 		}
 	}

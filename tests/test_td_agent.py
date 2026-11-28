@@ -81,11 +81,26 @@ class Handler(BaseHTTPRequestHandler):
             engines["qwen3-tts"]["modes"].append({"id": "preset", "speaker": True, "languages": True, "variant": "fixture"})
             engines["qwen3-tts"].update(speakers=["Fixture Speaker"], languageOptions=["auto"])
             self.reply({"apiVersion": 1, "product": "TimbreDeck", "instance": INSTANCE,
-                        "pid": os.getpid(), "engines": engines, "draft": PERSONAL_DRAFT})
+                        "pid": os.getpid(), "engines": engines, "draft": PERSONAL_DRAFT, **app.features})
         elif self.headers.get(agent.INSTANCE_HEADER) != INSTANCE:
             self.reply({"error": "Instance changed"}, 409)
         elif self.path == "/api/job":
             self.reply(app.job)
+        elif self.path == "/api/tts/resident":
+            self.reply(app.resident)
+        elif self.path == "/api/tts/stop":
+            if json.loads(body)["id"] != app.resident.get("id"):
+                self.reply({"error": "Resident changed"}, 409)
+            else:
+                app.resident = {"busy": False}
+                self.reply(app.resident)
+        elif self.path == "/api/profiles":
+            self.reply([{"id": JOB, "name": "Fixture", "language": "ja", "reference": PERSONAL_DRAFT,
+                         "transcript": PERSONAL_DRAFT, "localPath": PERSONAL_DRAFT}])
+        elif self.path == "/api/history/" + JOB:
+            self.reply({"id": JOB, "model": "v5dev", "seconds": 3.2, "sampleRate": 48000,
+                        "verifiedCuda": "cuda:0", "timing": {"resident": True, "generationSeconds": .6},
+                        "input": {"text": PERSONAL_DRAFT}})
         elif self.path == "/api/reference":
             self.reply({"id": hashlib.sha256(body).hexdigest(), "seconds": 4.1}, 201)
         elif self.path == "/api/asr":
@@ -115,6 +130,7 @@ class CLITests(unittest.TestCase):
         self.app = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.app.calls, self.app.job = [], None
         self.app.redirect, self.app.bad_media = False, False
+        self.app.features, self.app.resident = {}, {"busy": False}
         self.thread = threading.Thread(target=self.app.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.addCleanup(self.app.server_close)
@@ -156,6 +172,53 @@ class CLITests(unittest.TestCase):
         code, result = self.invoke("status", discovery=True)
         self.assertEqual((code, result["status"]), (0, "idle"))
         self.assertEqual(self.app.calls[-1][2], INSTANCE)
+
+    def test_latest_cleaning_option_and_dataset_controls(self):
+        self.app.features.update(actions=["dataset-options"], cleanModes=list(agent.CLEAN_MODES),
+                                 readyCleanModes=["mossformer", "lavasr-denoise"])
+        code, result = self.invoke("capabilities")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["cleaningModes"],list(agent.CLEAN_MODES))
+        self.assertEqual(result["readyCleaningModes"],["mossformer","lavasr-denoise"])
+        code, result = self.invoke("clean","--reference",str(self.fixture),"--mode","lavasr","--output-dir",str(self.output))
+        self.assertEqual((code,result["error"]["code"]),(1,"model_unavailable"))
+        self.assertFalse(any(c[1]=="/api/reference" for c in self.app.calls))
+        code, result = self.invoke("clean","--reference",str(self.fixture),"--mode","mossformer","--output-dir",str(self.output))
+        self.assertEqual(code,0,result)
+        code, result = self.invoke("dataset","--reference",str(self.fixture),"--language","ja",
+            "--clean-mode","lavasr-denoise","--no-split","--no-transcribe","--skip-unrecognized","--output-dir",str(self.output))
+        self.assertEqual(code,0,result)
+        data = next(json.loads(c[3]) for c in self.app.calls if c[1]=="/api/datasets/auto")
+        self.assertEqual([data[k] for k in ("cleanMode","split","transcribe","skipUnrecognized")],
+                         ["lavasr-denoise",False,False,True])
+        self.assertNotIn("training",data)
+
+    def test_resident_stop_requires_current_id_and_never_cancels_jobs(self):
+        self.app.features["actions"]=["resident-control"]
+        self.app.resident={"busy":False,"id":JOB,"kind":"tts","engine":"gpt-sovits","variant":"v2Pro"}
+        code, data = self.invoke("resident-status")
+        self.assertEqual((code,data["resident"]["id"]),(0,JOB))
+        code, data = self.invoke("stop-model","--resident-id",INSTANCE)
+        self.assertEqual((code,data["error"]["code"]),(1,"resident_changed"))
+        self.app.job={"id":INSTANCE,"status":"running"}
+        code, data = self.invoke("stop-model","--resident-id",JOB)
+        self.assertEqual((code,data["error"]["code"]),(1,"busy"))
+        self.assertFalse(any(c[0]=="POST" for c in self.app.calls))
+        self.app.job=None
+        code, data = self.invoke("stop-model","--resident-id",JOB)
+        self.assertEqual((code,data["stopped"]),(0,JOB))
+        self.assertFalse(any("/cancel/" in c[1] for c in self.app.calls))
+
+    def test_profile_and_output_metadata_are_filtered(self):
+        self.app.features["actions"]=["voice-metadata","output-metadata"]
+        code, data = self.invoke("voices")
+        self.assertEqual((code,data["voices"]), (0,[{"id":JOB,"name":"Fixture","language":"ja"}]))
+        code, data = self.invoke("synthesize","--engine","gpt-sovits","--text","Fixture",
+            "--reference",str(self.fixture),"--transcript","Fixture","--output-dir",str(self.output))
+        self.assertEqual(code,0,data)
+        self.assertEqual(data["output"]["sampleRate"],48000)
+        self.assertEqual(data["output"]["model"],"v5dev")
+        self.assertNotIn(PERSONAL_DRAFT,json.dumps(data))
 
     def test_capabilities_strip_draft_paths_and_details(self):
         self.app.job = {"id": JOB, "status": "running", "kind": "clean", "detail": PERSONAL_DRAFT}

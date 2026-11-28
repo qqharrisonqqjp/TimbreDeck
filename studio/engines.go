@@ -2,6 +2,10 @@ package main
 
 import "slices"
 
+const gptV5Link = "gpt-sovits-v5"
+
+func gptV5(variant string) bool { return variant == "v5turbo" || variant == "v5dev" }
+
 type synthesisMode struct {
 	ID          string `json:"id"`
 	Label       string `json:"label"`
@@ -27,7 +31,7 @@ type engineCapabilities struct {
 
 var engineCatalog = map[string]engineCapabilities{
 	"gpt-sovits": {
-		Variants: []string{"v2Pro"},
+		Variants: []string{"v2Pro", "v5turbo", "v5dev"},
 		Modes: []synthesisMode{
 			{ID: "clone", Label: "錄音複製", Reference: true, Transcript: true, Languages: true},
 		},

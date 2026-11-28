@@ -1,0 +1,88 @@
+/* Shell surfaces. Controls stay still; only the clipped hero decoration moves. */
+:root {
+  --bg:#f7f7f5;
+  --line:#dedfdb;
+  --ink:#1b232b;
+  --muted:#525c65;
+  --focus:#165baf;
+  --ease-out:cubic-bezier(.2,.7,.25,1);
+}
+[hidden]{display:none!important}
+#nav-toggle{display:none}
+.top{max-width:1530px;min-height:66px;padding-inline:clamp(16px,3vw,46px)}
+.top .brand{font-size:22px}
+#engine-open{margin-inline-start:auto;min-height:40px;background:var(--panel)}
+.shell{grid-template-columns:218px minmax(0,1fr);gap:0}
+.shell aside{padding:23px 12px 24px;border-color:var(--line);background:#f2f3ef}
+.shell main{margin:0;min-height:calc(100vh - 67px);padding-bottom:165px}
+#sections button{width:100%;min-height:38px;display:flex;align-items:center;gap:9px}
+#sections button[aria-current="page"]{background:var(--panel);box-shadow:0 2px 8px #1725340b}
+#sections #studio-exit{margin-top:10px;border-top-color:var(--line);color:var(--muted)}
+#exit-feedback:empty{display:none}
+.nav-icon{width:1.2rem;text-align:center;font-size:1.1em}
+.studio-hero{position:relative;isolation:isolate;overflow:hidden;min-height:112px;
+  margin:21px 0 16px;padding:20px clamp(14px,3vw,34px);border:1px solid var(--line);border-radius:20px;background:#fbfbf8}
+#hero-depth{position:absolute;z-index:-1;inset:-10px;pointer-events:none;
+  background:radial-gradient(ellipse at 88% 0%,#ddebef 0%,#ededdf80 45%,transparent 68%)}
+.studio-hero h1{margin:0;line-height:1.07;font-size:clamp(1.75rem,3.2vw,2.65rem);letter-spacing:-.045em}
+.studio-hero p{margin:8px 0 0;color:var(--muted)}
+body[data-recording="true"] #hero-depth{transform:none!important}
+.studio-editor{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(258px,1fr);gap:16px;align-items:start}
+.studio-main,.studio-inspector{min-width:0}
+.studio-inspector{position:sticky;top:14px;max-height:calc(100vh - 180px);overflow:auto;scrollbar-width:thin}
+.studio-generate{margin-top:14px;padding-top:10px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;border-top:1px solid var(--line)}
+.segmented{display:inline-flex;gap:4px;border:1px solid var(--line);border-radius:13px;padding:4px;background:#efefeb;margin-bottom:12px}
+.segmented button{border:1px solid transparent;background:none;min-height:38px}
+.segmented button[aria-pressed="true"]{background:white;color:var(--accent);border-color:var(--line);box-shadow:0 2px 6px #1e2e4410;font-weight:700}
+.review-conflict{padding-top:8px;border-top:1px solid #e8d3b7}
+.history-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.history-list>.card:not([data-compared="true"]){grid-column:1/-1}
+.history-list>.card[data-compared="true"]{border-color:var(--accent)}
+#activity{position:fixed;z-index:7;inset-inline:0;bottom:max(12px,env(safe-area-inset-bottom));
+  width:min(890px,calc(100% - 24px));margin-inline:auto;display:grid;gap:6px;pointer-events:none}
+#activity #job,#mini-player{pointer-events:auto;justify-self:center;max-width:100%;
+  background:#20282e;color:#fff;border:1px solid #303941;border-radius:21px;box-shadow:0 10px 34px #17253430;
+  padding:8px 12px;display:flex;flex-wrap:wrap;align-items:center;gap:9px}
+#activity #job button,#mini-player button{margin:0;min-height:34px}
+#activity #job .activity-status{font-size:.88rem;overflow-wrap:anywhere;max-width:min(100%,580px)}
+#mini-player audio{height:36px;max-width:100%;width:270px}
+#job progress{width:7.5rem}
+.activity-dot{width:8px;height:8px;border-radius:10px;background:#8ec4e3;flex:none}
+.activity-dot[data-status="done"]{background:#83d5a9}
+.activity-dot[data-status="failed"],.activity-dot[data-status="cancelled"]{background:#f6bb86}
+:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+#title:focus{outline:none}
+@media (max-width:940px){
+  .studio-editor{grid-template-columns:minmax(0,1fr)}
+  .studio-inspector{position:static;max-height:none;overflow:visible}
+}
+@media (max-width:760px){
+  #nav-toggle{display:inline-block;white-space:nowrap;font-size:.8rem;padding-inline:8px}
+  .top{gap:8px;padding-inline:12px;min-height:58px}
+  .top .brand{font-size:18px;letter-spacing:-.02em;white-space:nowrap}
+  .top .brand .mark{width:24px;height:24px;background-size:24px}
+  .top .brand small{display:none}
+  #engine-open{font-size:.8rem;max-width:40%;min-height:36px;padding-inline:7px}
+  .shell{display:block}
+  .shell aside{display:none;padding:8px 13px;border:0;border-bottom:1px solid var(--line)}
+  body.drawer-open .shell aside{display:block}
+  #sections{position:static;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));white-space:normal;overflow:visible;gap:5px}
+  #sections small{display:block;grid-column:1/-1;margin:5px 7px 1px}
+  #sections #studio-exit{grid-column:1/-1}
+  #sections button{min-height:42px}
+  .studio-hero{margin-top:13px}
+  .history-list{grid-template-columns:minmax(0,1fr)}
+  #activity #job,#mini-player{width:100%;justify-content:flex-start}
+  #activity #job .activity-status{font-size:.8rem;flex:1 1 76%}
+}
+@media (prefers-reduced-motion: no-preference){
+  body:not([data-motion="reduce"]):not([data-recording="true"]) #job:not([hidden]),body:not([data-motion="reduce"]) #mini-player:not([hidden]){
+    animation:activity-enter .18s var(--ease-out) both;
+  }
+  body:not([data-motion="reduce"]) #sections button{transition:background-color .16s ease,color .16s ease,border-color .16s ease}
+  @keyframes activity-enter{from{opacity:.65;transform:translateY(7px)}to{opacity:1;transform:none}}
+}
+body[data-motion="reduce"] *,body[data-motion="reduce"] *::before,body[data-motion="reduce"] *::after{
+  animation:none!important;transition:none!important;scroll-behavior:auto!important
+}
+@media (prefers-reduced-motion: reduce){#hero-depth{transform:none!important}}

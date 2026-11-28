@@ -1,0 +1,33 @@
+const cp=require('node:child_process'),os=require('node:os'),fs=require('node:fs'),p=require('node:path'),readline=require('node:readline'),assert=require('node:assert/strict');
+const r='D:/TimbreDeck',v=p.join(r,'validation-sts'),d=fs.mkdtempSync(p.join(v,'mic-'));
+fs.mkdirSync(p.join(d,'config'));
+fs.copyFileSync(p.join(r,'acceptance-80ebf58/more/release/StudioData/config/engines.json'),p.join(d,'config/engines.json'));
+const fake=p.join(v,'mic-fixture.wav');cp.execFileSync('ffmpeg',['-y','-v','error','-i',p.join(v,'source-synthetic.wav'),'-ar','16000','-ac','1',fake]);
+const links=p.join(os.homedir(),'AppData/Local/ms-playwright/.links'),lib=fs.readdirSync(links).map(n=>fs.readFileSync(p.join(links,n),'utf8').trim()).find(n=>n.endsWith('playwright-core')&&fs.existsSync(n));
+(async()=>{const exe=p.join(r,'source/Start-STS-mic-test.exe'),server=cp.spawn(exe,['-no-browser','-data',d],{windowsHide:true,stdio:['ignore','pipe','pipe'],env:{...process.env,OMP_NUM_THREADS:"4"}});let b;
+try{
+ const url=await new Promise((ok,err)=>{readline.createInterface({input:server.stdout}).once('line',l=>ok(l.trim().split(/\s+/).pop()));server.once('exit',err)});
+ b=await require(lib).chromium.launch({headless:true,chromiumSandbox:true,args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream','--use-file-for-fake-audio-capture='+fake]});
+ const page=await b.newPage({permissions:['microphone']});let active=[];
+ page.on('response',res=>{if(res.url().includes('/api/sts/live?'))active.push(res.status())});
+ await page.addInitScript(()=>{const f=AudioBufferSourceNode.prototype.start;AudioBufferSourceNode.prototype.start=function(...a){globalThis.stsAudio=(globalThis.stsAudio||0)+1;return f.apply(this,a)}});
+ await page.goto(url);await page.locator('#sections').getByRole('button',{name:'流式 STS',exact:true}).click();
+ const warmStart=Date.now();
+ await page.getByRole('button',{name:'開始啟動 STS 模型',exact:true}).click();
+ await page.getByText("模型已啟動，可以開咪。",{exact:true}).waitFor({timeout:170000});
+ const warmSeconds=(Date.now()-warmStart)/1000;
+ assert.deepEqual(await (await fetch(url+'/api/sts/worker')).json(),{pinned:true,resident:true});
+ await page.locator('#sts-reference').setInputFiles(p.join(v,'voice-synthetic.wav'));await page.getByText(/voice-synthetic\.wav ·/).waitFor();
+ const then=Date.now();await page.getByRole('button',{name:'啟動咪高峰',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector('#sts-mic')?.textContent.includes('已轉換 2 段'),null,{timeout:45000});
+ const audio=await page.evaluate(()=>globalThis.stsAudio);assert.ok(audio>=2&&active.every(v=>v===200));
+ const secs=(Date.now()-then)/1000;await page.getByRole('button',{name:'停止咪高峰',exact:true}).click();
+ assert.equal(await page.locator('#sts-mic').textContent(),"咪高峰已停止。");
+ assert.equal((await (await fetch(url+'/api/history')).json()).length,0);
+ await page.getByRole('button',{name:'停止 STS 模型',exact:true}).click();
+ await page.getByText("STS 模型已卸載。",{exact:true}).waitFor();
+ assert.deepEqual(await (await fetch(url+'/api/sts/worker')).json(),{pinned:false,resident:false});
+ const result={prewarm:true,warmSeconds,pinned:true,unloaded:true,micLabel:"TimbreDeck STS",audioPackets:audio,elapsedForTwo:secs,recordingSaved:false,simulatedMic:true};
+ fs.writeFileSync(p.join(v,'live-mic.json'),JSON.stringify(result,null,2));console.log(result);
+}finally{if(b)await b.close();server.kill()}
+})().catch(e=>{console.error(e);process.exitCode=1});

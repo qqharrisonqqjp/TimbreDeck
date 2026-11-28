@@ -36,7 +36,21 @@ func (s *studio) agentInfo(w http.ResponseWriter, r *http.Request) {
 		v := s.inspectSelected(k, paths)
 		out[k] = agentEngine{engineCapabilities: v.engineCapabilities, Ready: v.Ready, AvailableVariants: v.AvailableVariants}
 	}
-	send(w, 200, map[string]any{"product": "TimbreDeck", "apiVersion": 1, "pid": os.Getpid(), "instance": s.instance, "actions": []string{"status", "capabilities", "asr", "synthesize", "clean", "dataset"}, "engines": out})
+	ready := []string{}
+	if dir, err := cleanAssetsPath(); err == nil {
+		root := s.runtimePath("gpt-sovits", paths["gpt-sovits"])
+		for _, mode := range cleanModes {
+			if _, err := prepareCleanRuntime(mode, root, dir); err == nil {
+				ready = append(ready, mode)
+			}
+		}
+	}
+	send(w, 200, map[string]any{
+		"product": "TimbreDeck", "apiVersion": 1, "pid": os.Getpid(), "instance": s.instance,
+		"actions": []string{"status", "capabilities", "asr", "synthesize", "clean", "dataset", "sts",
+			"sts-models", "jobs-by-id", "dataset-options", "resident-control", "voice-metadata", "output-metadata"},
+		"engines": out, "build": buildInfo(), "cleanModes": cleanModes, "readyCleanModes": ready,
+	})
 }
 func (s *studio) runningAgentSession() string {
 	var m agentSession

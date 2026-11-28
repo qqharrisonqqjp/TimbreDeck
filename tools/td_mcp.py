@@ -26,6 +26,8 @@ LANGUAGES = ["yue", "zh", "en", "ja", "ko"]
 SYNTH_LANGUAGES = LANGUAGES + ["auto", "de", "fr", "ru", "pt", "es", "it"]
 ASR_LANGUAGES = SYNTH_LANGUAGES + ["nl", "ar", "hi", "th", "vi", "id"]
 ENGINES = ["gpt-sovits", "cosyvoice3", "voxcpm2", "indextts2", "qwen3-tts"]
+CLEAN_MODES = ["denoise", "uvr", "both", "mossformer", "lavasr", "lavasr-denoise"]
+DATASET_CLEAN_MODES = [mode for mode in CLEAN_MODES if mode not in ("uvr", "both")]
 MIMES = {".wav": "audio/wav", ".zip": "application/zip"}
 ID_PATTERN = r"^[0-9a-f]{32}$"
 
@@ -61,8 +63,17 @@ BOOL = {"type": "boolean"}
 TOOLS = [tool(*args, **kwargs) for args, kwargs in [
     (("capabilities", "Read local TimbreDeck engine and feature capabilities."), {"read_only": True}),
     (("status", "Read local TimbreDeck Studio status and any current job."), {"read_only": True}),
+    (("voices", "List names, IDs and languages of saved local voices for explicitly requested synthesis; no audio or transcripts."), {"read_only": True}),
+    (("resident_status", "Read the current resident TTS/STS model ID and busy state."), {"read_only": True}),
+    (("warm_model", "Preload an explicitly selected TTS or STS model. Never replaces a pinned model or interrupts a job.",
+      {"kind":enum(("tts","sts")), "engine":string(80,pattern=r"^[a-z0-9-]+$"),
+       "variant":string(48,pattern=r"^[A-Za-z0-9_-]+$"), "model_project":string(32,pattern=ID_PATTERN)}, ("kind","engine")), {}),
+    (("stop_model", "Only on explicit user request: unload the exact confirmed resident ID from resident_status while idle; this does not cancel work.",
+      {"resident_id":string(32,pattern=ID_PATTERN)}, ("resident_id",)), {}),
     (("asr", "Transcribe an explicitly selected local WAV; may import this WAV into the local Studio.",
       {"reference": PATH, "language": enum(ASR_LANGUAGES),"asr_model":string(80,pattern=r"^[a-z0-9-]+$")}, ("reference",)), {}),
+    (("sts","Convert explicitly selected recorded speech to a target reference timbre and export WAV.",
+      {"source":PATH,"reference":PATH,"model":enum(("cosyvoice3","x-vc","seed-vc-tiny","meanvc2","tvtsyn1")),"streaming":BOOL},("source","reference")),{}),
     (("synthesize", "Generate and export a new WAV with a configured local voice engine.",
       {"engine": string(80,pattern=r"^[a-z0-9-]+$"), "text": string(10000), "language": enum(SYNTH_LANGUAGES),
        "mode": string(48, pattern=r"^[A-Za-z0-9_-]+$"), "reference": PATH,
@@ -74,11 +85,13 @@ TOOLS = [tool(*args, **kwargs) for args, kwargs in [
        "model_project": string(32, pattern=ID_PATTERN), "preview": BOOL,"split_at":number(20,2000,"integer"),
        "split_gap_ms":number(0,5000,"integer"),"separate_parts":BOOL,"asr_model":string(80,pattern=r"^[a-z0-9-]+$")},
       ("engine", "text")), {}),
-    (("clean", "Denoise or isolate speech from the explicitly ordered WAVs, then export a new WAV.",
-      {"references": REFS, "mode": enum(["denoise", "uvr", "both"]), "gap_ms": number(0, 3000, "integer")},
+    (("clean", "Clean explicitly ordered recordings and export a new 32 kHz WAV. MossFormer masks noise, LavaSR restores bandwidth, lavasr-denoise does both.",
+      {"references": REFS, "mode": enum(CLEAN_MODES), "gap_ms": number(0, 3000, "integer")},
       ("references",)), {}),
-    (("dataset", "Split and transcribe explicitly selected WAVs for a GPT-SoVITS dataset; export a new ZIP.",
-      {"references": REFS, "language": enum(LANGUAGES), "speaker": string(64), "denoise": BOOL,"asr_model":string(80,pattern=r"^[a-z0-9-]+$")},
+    (("dataset", "Prepare explicitly selected training recordings and export ZIP for review. Never starts training.",
+      {"references": REFS, "language": enum(LANGUAGES), "speaker": string(64), "denoise": BOOL,
+       "clean_mode":enum(DATASET_CLEAN_MODES), "no_split":BOOL, "no_transcribe":BOOL,"skip_unrecognized":BOOL,
+       "asr_model":string(80,pattern=r"^[a-z0-9-]+$")},
       ("references", "language")), {}),
 ]]
 BY_NAME = {item["name"]: item for item in TOOLS}
@@ -148,14 +161,14 @@ def cli_arguments(spec, args, input_root, output_root):
     props = schema["properties"]
     if set(args) - props.keys() or set(schema["required"]) - args.keys():
         raise ValueError("Unknown or missing tool arguments")
-    action = spec["name"].removeprefix("timbredeck_")
+    action = spec["name"].removeprefix("timbredeck_").replace("_","-")
     command = [action]
     for key, value in args.items():
         validate(value, props[key], key)
         option = "--" + key.replace("_", "-")
         if key == "references":
             command.extend("--reference=" + local_wav(path, input_root) for path in value)
-        elif key in ("reference", "emotion_reference"):
+        elif key in ("source","reference", "emotion_reference"):
             command.append(option + "=" + local_wav(value, input_root))
         elif key == "emotion_weights":
             command.extend([option] + [format(x, ".10f") for x in value])
@@ -164,7 +177,7 @@ def cli_arguments(spec, args, input_root, output_root):
                 command.append(option)
         else:
             command.append(f"{option}={value}")
-    if action in ("synthesize", "clean", "dataset"):
+    if action in ("synthesize", "clean", "dataset","sts"):
         command.append("--output-dir=" + str(output_root))
     return command
 
@@ -237,7 +250,7 @@ def local_artifacts(result, root):
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("CLI did not provide the artifact SHA-256")
         info = {"path": str(path), "uri": uri, "type": mime, "bytes": size, "sha256": digest}
-        for key, pattern in [("job", r"[0-9a-f]{32}"), ("kind", r"synthesis|clean|dataset")]:
+        for key, pattern in [("job", r"[0-9a-f]{32}"), ("kind", r"synthesis|clean|dataset|sts")]:
             if isinstance(item.get(key), str) and re.fullmatch(pattern, item[key]):
                 info[key] = item[key]
         safe.append(info)

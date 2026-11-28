@@ -34,6 +34,16 @@ func runtimeRequirements(engine string) []string {
 }
 
 func modelMissing(engine, variant, root string) []string {
+	if engine == "gpt-sovits" && gptV5(variant) {
+		base := modelFolder(engine, variant) + "/"
+		return missingFiles(root, []string{
+			base + "s1v3.ckpt", base + "gsv-v5-pretrained/s2G" + variant + ".pth", base + "gsv-v5-pretrained/vocoder.pth",
+			base + "chinese-roberta-wwm-ext-large/config.json",
+			base + "chinese-roberta-wwm-ext-large/model.safetensors|" + base + "chinese-roberta-wwm-ext-large/pytorch_model.bin",
+			base + "chinese-hubert-base/config.json",
+			base + "chinese-hubert-base/model.safetensors|" + base + "chinese-hubert-base/pytorch_model.bin",
+		})
+	}
 	if engine == "qwen3-tts" {
 		model := filepath.Join(root, modelFolder(engine, variant))
 		missing := missingFiles(model, []string{
@@ -78,6 +88,9 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 	v.EngineInstalled = len(v.Missing) == 0
 	var missingModel []string
 	for _, variant := range v.Variants {
+		if engine == "gpt-sovits" && gptV5(variant) {
+			continue // The existing v2Pro runtime stays separate.
+		}
 		missing := modelMissing(engine, variant, root)
 		if len(missing) == 0 {
 			v.AvailableVariants = append(v.AvailableVariants, variant)
@@ -90,6 +103,11 @@ func (s *studio) inspect(engine string, paths map[string]string) installation {
 	}
 	v.Ready = v.EngineInstalled && len(v.AvailableVariants) > 0
 	return v
+}
+
+func gptV5Runtime(root string) bool {
+	return filepath.IsAbs(root) && len(missingFiles(root, []string{"runtime/python.exe",
+		"GPT_SoVITS/TTS_infer_pack/TTS.py", "GPT_SoVITS/module/models_v5.py", "tools/portable_runtime.py"})) == 0
 }
 
 func packFolders(parent string) []string {
@@ -118,7 +136,20 @@ func (s *studio) inspectSelected(engine string, paths map[string]string) install
 			}
 		}
 	}
+	if engine == "gpt-sovits" {
+		v.GPTV5Path = paths[gptV5Link]
+		v.GPTV5Installed = gptV5Runtime(v.GPTV5Path)
+	}
 	for _, variant := range v.Variants {
+		runtimeRoot, runtimeReady := v.Path, v.EngineInstalled
+		bundled := slices.Contains(available, variant)
+		if engine == "gpt-sovits" && gptV5(variant) {
+			runtimeRoot, runtimeReady = v.GPTV5Path, v.GPTV5Installed
+			if !runtimeReady {
+				continue
+			}
+			bundled = len(modelMissing(engine, variant, runtimeRoot)) == 0
+		}
 		runtime, models := "", ""
 		parent := s.path("models", engine, variant)
 		var selection string
@@ -129,12 +160,12 @@ func (s *studio) inspectSelected(engine string, paths map[string]string) install
 				models = candidate
 			}
 		}
-		if models == "" && slices.Contains(available, variant) {
-			models = v.Path
+		if models == "" && bundled {
+			models = runtimeRoot
 		}
 		if models != "" {
-			if v.EngineInstalled {
-				runtime = v.Path
+			if runtimeReady {
+				runtime = runtimeRoot
 			}
 		}
 		if models == "" {
@@ -142,8 +173,8 @@ func (s *studio) inspectSelected(engine string, paths map[string]string) install
 				candidate := filepath.Join(parent, id)
 				if len(modelMissing(engine, variant, candidate)) == 0 {
 					models = candidate
-					if v.EngineInstalled {
-						runtime = v.Path
+					if runtimeReady {
+						runtime = runtimeRoot
 					}
 					break
 				}
@@ -165,6 +196,7 @@ func (s *studio) inspectSelected(engine string, paths map[string]string) install
 			v.variantPaths[variant] = runtime
 		}
 	}
+	v.EngineInstalled = v.EngineInstalled || v.GPTV5Installed
 	v.Ready = len(v.variantPaths) > 0
 	if v.Ready {
 		v.Missing = nil

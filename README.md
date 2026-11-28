@@ -6,11 +6,11 @@ English | A portable multi-engine speech studio for Windows. Select an engine, t
 
 ## 專案狀態 · Project status
 
-Windows x64 啟動器預覽版可用於管理角色錄音、保存草稿、試讀、生成及比較 WAV。五款引擎均已有介接程式，使用時需連接對應本機執行環境及權重。自動測試以替身驗證 15 種模式，真實模型的 Windows 顯示卡推理仍待驗收。
+Windows x64 聲台支援語音合成、即時轉換、角色管理、素材清理及 GPT-SoVITS 訓練。各引擎需要獨立的執行環境及權重；已安裝項目與可用模式以工作室回報為準。真實 GPU 測試與替身測試分開列於驗收資料，預覽版 ZIP 本身不含模型或使用者資料。
 
-**[下載 Windows 預覽版 / Windows previews](https://github.com/qqharrisonqqjp/TimbreDeck/releases)** · [啟動及引擎設定 / Getting started](docs/PREVIEW.md)
+**[下載 Windows 預覽版 / Windows previews](https://github.com/qqharrisonqqjp/TimbreDeck/releases)** · [啟動與工作區 / Getting started](docs/WORKSTATION.zh-HK.md)
 
-The Windows x64 launcher provides a local studio for reference WAVs, voice profiles, synthesis, comparison and export. All five adapters require complete local engine installations. Automated fixtures cover 15 modes. Windows GPU validation with real weights is pending.
+The launcher and AI command share the same data directory and running Studio. Open the extracted package with `Open-TimbreDeck.cmd`; the exact version and build ID are shown in Settings and by `TimbreDeck-AI.exe status`. Engine runtimes, model weights, audio and project data are separate from the portable package.
 
 | Engine | 預定工作流程 / Planned workflow |
 |---|---|
@@ -22,8 +22,10 @@ The Windows x64 launcher provides a local studio for reference WAVs, voice profi
 
 ## 介面與發佈 · Interface and distribution
 
-左上角顯示 TimbreDeck 聲台，右上角切換五款引擎。次目錄按引擎提供可用的工作模式。逐字稿與輸出台詞各自有獨立欄位。完整五引擎安裝暫估 65–95 GB，建議預留 100–120 GB 可用空間作安裝與更新。
+左邊工作區同合成引擎各自保留選擇。底部作業島可睇進度或試聽歷史輸出。首次啟動使用套件旁的 `StudioData`，既有本機部署沿用原資料路徑；可用絕對路徑環境變數 `TD_STUDIO_DATA` 指定其他工作區。
 
-The product name stays at the top left. The engine switcher stays at the top right. Each engine has its own workspace, secondary navigation and controls. Reference transcripts and output scripts have separate fields. A complete installation is budgeted at 65–95 GB, with 100–120 GB of free space recommended for setup and updates. Final sizes require Windows measurements.
+The Windows builder creates a ZIP, a checksum file, and a manifest of the included files. The only bundled voice is the opt-in [2B reference](docs/examples/2B/reference.wav) with its [profile metadata](docs/examples/2B/profile.json); other recordings, histories, drafts, data and weights are excluded.
 
-[繁體中文開發規格與容量計算](docs/PLAN.zh-Hant.md) · [引擎版本與授權 / Upstream revisions and licenses](engines/README.md)
+[AI CLI / MCP 使用指南](docs/AI.zh-HK.md)
+
+[使用指南](docs/WORKSTATION.zh-HK.md) · [原始碼、開發規格及上游授權](https://github.com/qqharrisonqqjp/TimbreDeck)

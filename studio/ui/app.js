@@ -14,8 +14,7 @@ const catalog = {
     "以 Base、CustomVoice 或 VoiceDesign 選擇聲線。",
   ],
 };
-const cleanWorkspace = ["去去除雜聲", "批量清理本機 WAV，按指定次序合併及匯出。"];
-const workspaces = { ...catalog, clean: cleanWorkspace };
+const cleanWorkspace = ["去除雜聲", "批量清理本機 WAV，按指定次序合併及匯出。"];
 let cleanOpen = false;
 const integrated = (k) => Boolean(engines[k]?.modes?.length);
 const lang = {
@@ -38,6 +37,7 @@ const referenceLanguages = Object.fromEntries(
 const emotions = ["喜悅", "憤怒", "悲傷", "恐懼", "厭惡", "憂鬱", "驚訝", "平靜"];
 let draft,
   engines,
+  studioBuild,
   voices = [],
   editingVoice = null,
   trainingProject = null,
@@ -46,11 +46,12 @@ let draft,
   currentJob,
   timer,
   writes = Promise.resolve(),
-  revision = 0,
+  revision = 0, savedRevision = 0,
   renderID = 0;
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, val] of Object.entries(props)) {
+    if (val === undefined || val === null) continue;
     if (key.startsWith("aria-")) node.setAttribute(key, val);
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), val);
     else node[key] = val;
@@ -84,9 +85,9 @@ function hint(text) {
 function box(cls, ...nodes) {
   return el("div", { className: cls }, ...nodes);
 }
-async function api(path, method = "GET", data) {
+async function api(path, method = "GET", data, {responseType = "json", signal} = {}) {
   const blob = data instanceof Blob;
-  const opts = { method, headers: { "X-TimbreDeck": "1" } };
+  const opts = { method, signal, headers: { "X-TimbreDeck": "1" } };
   if (data !== undefined) {
     opts.headers["Content-Type"] = blob
       ? "application/octet-stream"
@@ -94,8 +95,13 @@ async function api(path, method = "GET", data) {
     opts.body = blob ? data : JSON.stringify(data);
   }
   const res = await fetch("/api/" + path, opts);
-  const body = await res.json();
-  if (!res.ok) throw Error(body.error || "HTTP " + res.status);
+  if (res.ok && responseType === "blob") return res.blob();
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err=Error(body.error || "HTTP " + res.status);
+    err.status=res.status;
+    throw err;
+  }
   return body;
 }
 function d() {
@@ -106,18 +112,8 @@ function selectedMode(engine, id) {
     engine.modes.find((mode) => engine.availableVariants?.includes(mode.variant)) ??
     engine.modes[0];
 }
-function canRun(engine, mode) {
-  return engine.ready && (!mode.variant || engine.availableVariants?.includes(mode.variant));
-}
-function panel() {
-  if (cleanOpen) return "clean";
-  const v = d().tab;
-  if (v === "training" && draft.engine === "gpt-sovits") return v;
-  return ["models", "history", "voices", "storage"].includes(v)
-    ? v
-    : integrated(draft.engine)
-      ? "synth"
-      : "models";
+function canRun(engine, mode, variant = mode.variant) {
+  return engine.ready && (!variant || engine.availableVariants?.includes(variant));
 }
 function persist() {
   clearTimeout(timer);
@@ -127,12 +123,16 @@ function persist() {
     .catch(() => {})
     .then(() => api("draft", "PUT", copy))
     .then(() => {
+      savedRevision = rev;
       if (rev === revision) $("saved").textContent = "草稿已儲存至本機";
+      return true;
     })
     .catch((e) => {
       notice(e);
       $("saved").textContent = "草稿儲存失敗";
+      return false;
     });
+  return writes;
 }
 function changed() {
   clearTimeout(timer);
@@ -155,25 +155,30 @@ function area(id, value, placeholder, update) {
   });
 }
 function setEngine(k) {
-  arenaOpen="";
-  if ($("engine-dialog").open) $("engine-dialog").close();
-  if (k === "clean") {
-    cleanOpen = true;
-  } else {
-    cleanOpen = false;
-    if (draft.engine !== k) {
-      draft.engine = k;
-      persist();
-    }
-  }
+  if(k==="clean")return setTab("clean");
+  if(!engines[k])return;
+  if($("engine-dialog").open)$("engine-dialog").close();
+  if(draft.engine!==k){draft.engine=k;persist()}
   render();
 }
-function setTab(k) {
-  arenaOpen="";
-  cleanOpen = false;
-  d().tab = k;
+function setTab(key,focus=false) {
+  if(!Object.hasOwn(routesByKey,key))return;
+  if(workspace==="sts" && key!=="sts" && mic) {
+    if(!window.confirm("離開流式 STS 會停止收音。要離開嗎？"))return;
+    stopMic();
+  }
+  if(workspace==="training" && key!=="training")rememberReview();
+  workspace=key;
+  setWorkspaceFlags();
+  draft.workspace=key;
   persist();
+  setDrawer(false);
   render();
+  if(focus)$("title").focus({preventScroll:true});
+}
+function setWorkspaceFlags() {
+  cleanOpen=workspace==="clean";
+  arenaOpen=["sts","tts","asr"].includes(workspace)?workspace:"";
 }
 function selectedVoice() {
   return voices.find((voice) => voice.id === draft.voiceId);
@@ -187,12 +192,18 @@ function useVoice(voice) {
 }
 function selectedTrainedModel(settings) {
   if (settings.modelVoice === (draft.voiceId || "")) return settings.modelProject || "";
-  return selectedVoice()?.modelProject || "";
+  const key = selectedVoice()?.modelProject;
+  return trainedModels.some(m => m.id === key) ? key : "";
 }
 function modelOptions(base, selected) {
   const models = { "": base, ...Object.fromEntries(trainedModels.map((model) => [model.id, model.name])) };
   if (selected && !models[selected]) models[selected] = "找不到已選模型";
   return models;
+}
+function variantName(value) {
+  if (value === "v5turbo") return "V5 Turbo";
+  if (value === "v5dev") return "V5 Dev";
+  return value === "Fun-CosyVoice3-0.5B" ? "Fun-CosyVoice3-0.5B-2512" : value;
 }
 function referenceTranscript(settings) {
   const voice = selectedVoice();
@@ -215,68 +226,58 @@ function replaceReference(reference, name) {
   delete draft.voiceId;
 }
 function render() {
+  clearTrainingPreviews();
   renderID++;
-  const k = cleanOpen ? "clean" : draft.engine;
-  document.body.dataset.engine = k;
-  $("title").textContent = arenaOpen ? arenaOpen.toUpperCase()+" 擂臺" : workspaces[k][0];
-  $("subtitle").textContent = arenaOpen ? "同一段素材；每個模型逐個執行，完成後並排比較。" : workspaces[k][1];
-  $("state").textContent = cleanOpen ? "本機工具" : !integrated(k)
-    ? "待接通"
-    : engines[k].ready
-      ? "已找到引擎檔案"
-      : engines[k].engineInstalled ? "未安裝模型" : "未安裝引擎";
-  $("notice").textContent = "";
-  $("switcher").replaceChildren(
-    ...Object.keys(workspaces).map((id) =>
-      btn(workspaces[id][0], () => setEngine(id), {
-        "aria-pressed": String(id === k),
-      }),
-    ),
-  );
-  $("compact").value = k;
+  const k=draft.engine;
+  document.body.dataset.engine=cleanOpen?"clean":k;
+  showWorkspaceHeadline();
+  $("notice").textContent="";
+  $("switcher").replaceChildren(...Object.keys(engines).map(key=>
+    btn(catalog[key]?.[0]||key,()=>setEngine(key),{"aria-pressed":String(key===k)})));
   drawSections();
-  if (arenaOpen) {
-    $("tabs").hidden=true;
-    drawArena();
-    showJob();
-    return;
+  switch(workspace) {
+    case "sts": drawSTS();break;
+    case "asr": case "tts": drawArena();break;
+    case "clean": cleaning();break;
+    case "synth":
+      if(integrated(k))synthesis();
+      else $("work").replaceChildren(card("先連接合成引擎",btn("開啟模型管理",()=>setTab("models"),{className:"primary"})));
+      break;
+    case "models": models();break;
+    case "voices": voiceLibrary();break;
+    case "training": training();break;
+    case "storage": storageSettings();break;
+    default: history();
   }
-  if (cleanOpen) {
-    $("tabs").hidden = true;
-    $("tabs").replaceChildren();
-    cleaning();
-    showJob();
-    return;
-  }
-  $("tabs").hidden = false;
-  const tabs = {
-    ...(integrated(k) ? { synth: "語音合成" } : {}),
-    models: "模型管理",
-    voices: "聲音庫",
-    ...(k === "gpt-sovits" ? { training: "訓練素材" } : {}),
-    history: "輸出歷史",
-    storage: "設定",
-  };
-  $("tabs").replaceChildren(
-    ...Object.entries(tabs).map(([id, label]) =>
-      btn(label, () => setTab(id), {
-        "aria-current": panel() === id ? "page" : "false",
-      }),
-    ),
-  );
-  if (panel() === "synth") synthesis();
-  else if (panel() === "models") models();
-  else if (panel() === "voices") voiceLibrary();
-  else if (panel() === "training") training();
-  else if (panel() === "storage") storageSettings();
-  else history();
   showJob();
 }
 const cleanModes = {
   denoise: "基礎去噪",
+  mossformer: "ClearerVoice · MossFormer2",
+  lavasr: "LavaSR v2 · 頻寬修復",
+  "lavasr-denoise": "LavaSR v2 · 頻寬修復＋去噪",
   uvr: "UVR 人聲分離",
   both: "先用 UVR5 分離人聲，再做語音降噪",
 };
+const cleanHelp = {
+  "":"已清理或原聲乾淨嘅素材可跳過。",
+  denoise:"一般背景底噪，可先試基礎去噪。",
+  mossformer:"適合有底噪、但聲線清楚嘅訓練素材。48 kHz 遮罩式去噪；不等於超解析。先試聽齒音同尾音。",
+  lavasr:"適合低採樣率、電話或舊影片嘅悶聲；會重建部分高頻，可能改變音色。乾淨素材毋須用。",
+  "lavasr-denoise":"適合又悶又嘈嘅素材。比單純頻寬修復多做去噪；建議先試聽。",
+};
+function cleanPicker(options, value, change, id) {
+  const help = hint(cleanHelp[value] || "將人聲與伴奏分開，視乎所選模式再去噪。");
+  help.id = id+"-help";
+  const picker = select(options,value,v=>{change(v);help.textContent=cleanHelp[v]||"將人聲與伴奏分開，視乎所選模式再去噪。";},id);
+  picker.setAttribute("aria-describedby",help.id);
+  return box("stack",field("清理模式",picker),help);
+}
+function trainingCleanPicker(value, change, id) {
+  const options = {"":"不處理"};
+  for (const k of ["denoise","mossformer","lavasr","lavasr-denoise"]) options[k]=cleanModes[k];
+  return cleanPicker(options,value,change,id);
+}
 const cleanMaxClips = 24;
 const cleanMaxGap = 3000;
 const cleanMaxSeconds = 180;
@@ -521,7 +522,7 @@ function cleaning() {
       cleanStatus();
     },
   });
-  const mode = select(cleanModes, cleanMode, (v) => { cleanMode = v; }, "clean-mode");
+  const mode = cleanPicker(cleanModes, cleanMode, (v) => { cleanMode = v; }, "clean-mode");
   const gap = el("input", {
     type: "number", id: "clean-gap", min: "0", max: String(cleanMaxGap), step: "1", value: cleanGap,
     "aria-describedby": "clean-length",
@@ -542,7 +543,8 @@ function cleaning() {
         }, { id: "clean-add" }),
       ),
       card("清理及合併",
-        field("清理模式", mode),
+        mode,
+        hint("清理和訓練流程統一輸出 32 kHz WAV。"),
         field("段與段之間的間隔（毫秒）", gap),
         hint("最多 24 段；合併後連間隔最長 180 秒。"),
         el("p", { id: "clean-length", className: "hint", role: "status" }),
@@ -746,141 +748,74 @@ function drawCleanASR() {
     asrPanel("clean-asr", ctx, { hint: "逐字稿只供校對，不會改變清理或合併作業。" }));
 }
 
-const datasetMax = 24, datasetSeconds = 180;
-const datasetLanguages = Object.fromEntries(Object.entries(referenceLanguages).filter(([key]) => key !== "auto"));
-const datasetState = { clips: [], language: "yue", speaker: "", denoise: false, importing: false, submitting: false };
-let datasetHistoryTicket = 0;
-function datasetControls() {
-  const start = $("dataset-run");
-  if (!start) return;
-  const total = datasetState.clips.reduce((sum, { seconds }) => sum + (seconds || 0), 0);
-  const locked = datasetState.importing || datasetState.submitting;
-  const speaker = datasetState.speaker.trim();
-  const speakerInvalid = Array.from(speaker).length > 64 || /[|\p{Cc}]/u.test(speaker);
-  const busy = ["running", "cancelling"].includes(currentJob?.status);
-  start.disabled = locked || busy || !datasetState.clips.length || total > datasetSeconds || speakerInvalid;
-  $("dataset-files-input").disabled = locked || datasetState.clips.length >= datasetMax;
-  $("dataset-speaker").setAttribute("aria-invalid", String(speakerInvalid));
-  $("dataset-status").textContent = [
-    datasetState.clips.length + " / " + datasetMax + " 段 · " + total.toFixed(1) + " / " + datasetSeconds + " 秒",
-    speakerInvalid && "說話者名稱最多 64 字，不可包含直線符號或控制字元。",
-    datasetState.importing && "正在匯入所選錄音…",
-    datasetState.submitting && "正在提交…",
-    total > datasetSeconds && "總長度過長，請移除部份錄音。",
-  ].filter(Boolean).join("　");
+let ttsSwitching=false;
+function gptVariant(settings, engine) {
+  if (engine.variants.includes(settings.variant)) return settings.variant;
+  if (engine.availableVariants?.length && !engine.availableVariants.includes("v2Pro")) return engine.availableVariants[0];
+  return "v2Pro";
 }
-function drawDatasetFiles() {
-  const list = $("dataset-files");
-  if (!list) return;
-  list.replaceChildren(...datasetState.clips.map((clip, i) =>
-    el("li", {}, box("actions",
-      el("span", { className: "file-name" }, clip.name + (Number.isFinite(clip.seconds) ? " · " + clip.seconds.toFixed(1) + " 秒" : "")),
-      btn("移除", () => {
-        if (datasetState.importing || datasetState.submitting) return;
-        datasetState.clips.splice(i, 1);
-        drawDatasetFiles();
-      }, { "aria-label": "移除訓練檔 " + clip.name, disabled: datasetState.importing || datasetState.submitting }),
-    )),
-  ));
-  datasetControls();
+function selectedTTS(k, settings, engine, mode){
+  const variant=k==="gpt-sovits"?gptVariant(settings,engine):mode.variant||engine.variants[0];
+  return {engine:k,variant,modelProject:k==="gpt-sovits"&&variant==="v2Pro"?selectedTrainedModel(settings):""};
 }
-async function importDatasetClips(input) {
-  if (datasetState.importing || datasetState.submitting) return;
-  const files = Array.from(input.files);
-  if (!files.length) return;
-  input.value = "";
-  datasetState.importing = true;
-  drawDatasetFiles();
-  const messages = [];
-  try {
-    for (const file of files) {
-      if (datasetState.clips.length >= datasetMax) {
-        messages.push("只匯入上限以內的檔案；每次最多 24 段。");
-        break;
-      }
-      try {
-        const result = await api("reference", "POST", file);
-        if (!validRef(result.id)) throw Error("啟動器沒有回傳錄音編號。");
-        if (datasetState.clips.some((clip) => clip.id === result.id)) {
-          messages.push(file.name + " 與已選錄音相同，未重複加入。");
-        } else {
-          datasetState.clips.push({ id: result.id, name: file.name, seconds: result.seconds });
-        }
-      } catch (err) { messages.push(file.name + "：" + err.message); }
+function residentName(p){
+  const project=trainedModels.find(m=>m.id===p.modelProject)?.name;
+  return [p.kind==="sts"?(stsNames[p.engine]||p.engine):catalog[p.engine]?.[0]||p.engine,
+    variantName(p.variant),project||(p.modelProject?"微調權重":"")].filter(Boolean).join(" · ");
+}
+function sameTTS(a,b){
+  return a.kind==="tts"&&a.engine===b.engine&&a.variant===b.variant&&(a.modelProject||"")===(b.modelProject||"");
+}
+async function ttsWaitJob(job) {
+  if(job?.kind!=="tts-warm")return;
+  currentJob=job;showJob();
+  await waitForJob(job,{timeout:5*60*1000});
+}
+async function startResidentTTS(target){
+  if(ttsSwitching)return false;
+  ttsSwitching=true;
+  try{
+    const resident=await api("tts/resident");
+    if(resident.busy)throw Error("請等目前作業完成，才切換模型。");
+    if(!resident.id||sameTTS(resident,target)){
+      try{
+        await ttsWaitJob(await api("tts/warm","POST",target));
+        return true;
+      }catch(e){if(!resident.id||e.status!==409)throw e;}
     }
-  } finally {
-    datasetState.importing = false;
-    drawDatasetFiles();
-    if (messages.length && panel() === "training") notice(messages.join(" "));
-  }
+    if(!window.confirm("目前常駐："+residentName(resident)+"。\n先停止佢，再啟動所選 TTS 模型？"))return false;
+    await ttsWaitJob(await api("tts/warm","POST",{...target,replace:resident.id}));
+    return true;
+  }finally{ttsSwitching=false;}
 }
-async function submitDataset() {
-  const button = $("dataset-run");
-  if (!button || button.disabled) return;
-  datasetState.submitting = true;
-  drawDatasetFiles();
-  try {
-    currentJob = await api("datasets/auto", "POST", {
-      references: datasetState.clips.map(({ id }) => id),
-      language: datasetState.language,
-      speaker: datasetState.speaker.trim() || "speaker-1",
-      denoise: datasetState.denoise,
-      ...(asrChoice?{asrModel:asrChoice}:{}),
-    });
-    showJob();
-  } finally {
-    datasetState.submitting = false;
-    drawDatasetFiles();
-  }
+async function confirmSTSResident() {
+  const current=await api("tts/resident");
+  if(current.busy)throw Error("請等目前作業完成。");
+  if(!current.id || current.kind==="sts"&&current.engine===sts.model)return "";
+  return window.confirm("目前常駐："+residentName(current)+"。先停止佢，再使用所選 STS 模型？") ? current.id : null;
 }
-async function loadDatasetHistory(mark = renderID) {
-  const element = $("dataset-history");
-  if (!element) return;
-  const ticket = ++datasetHistoryTicket;
-  const live = () => ticket === datasetHistoryTicket && mark === renderID && element.isConnected;
-  try {
-    const items = await api("datasets/auto");
-    if (!live()) return;
-    const cases = (items || []).filter((item) => /^[a-f0-9]{32}$/.test(item.id || ""));
-    element.replaceChildren(...(cases.length ? cases.map((item) => box("actions",
-      hint(item.speaker + " · " + item.count + " 段"),
-      el("a", { className: "linkbtn", href: "/api/datasets/auto/" + item.id + "/download", download: "" }, "下載資料集"),
-    )) : [hint("完成的資料集會在這裏顯示。")]));
-  } catch (e) {
-    if (live()) element.replaceChildren(hint("未能讀取資料集：" + e.message));
-  }
-}
-function autoDatasetPanel() {
-  const checkbox = el("input", {
-    type: "checkbox", id: "dataset-denoise", checked: datasetState.denoise,
-    onchange: (e) => { datasetState.denoise = e.target.checked; },
+function ttsResidentPanel(target){
+  const status=el("p",{role:"status",id:"tts-resident-status"},"正在讀取常駐模型…");
+  const start=btn("開始啟動 TTS 模型",async()=>{
+    start.disabled=true;
+    try{await startResidentTTS(target)}finally{if(status.isConnected)refresh()}
   });
-  const section = card("一鍵建立訓練資料集",
-    hint("只會使用你在此明確選取的 WAV，不會加入目前參考錄音、聲音庫或舊作業。建立後仍需查閱與校對，不會自動開始訓練。"),
-    field("選取訓練 WAV（可選多個）", el("input", {
-      type: "file", accept: mediaAccept, multiple: true, id: "dataset-files-input",
-      onchange: (e) => importDatasetClips(e.target).catch(notice),
-    })),
-    el("ol", { id: "dataset-files", className: "dataset-files", "aria-label": "已選訓練錄音" }),
-    box("row",
-      field("訓練錄音語言", select(datasetLanguages, datasetState.language, (v) => { datasetState.language = v; }, "dataset-language")),
-      field("辨識模型",asrModelPicker(saveASRChoice)),
-      field("說話者（可選）", el("input", {
-        type: "text", id: "dataset-speaker", value: datasetState.speaker, placeholder: "speaker-1", maxLength: 128,
-        oninput: (e) => { datasetState.speaker = e.target.value; datasetControls(); },
-      })),
-    ),
-    el("label", { className: "dataset-option" }, checkbox, "切片前先做基礎去噪"),
-    el("p", { id: "dataset-status", className: "asr-status hint", role: "status" }),
-    btn("建立資料集", submitDataset, { id: "dataset-run", className: "primary", disabled: true }),
-    el("h3", {}, "已建立的資料集"),
-    el("div", { id: "dataset-history", "aria-live": "polite" }, hint("正在讀取資料集…")),
-  );
-  section.classList.add("dataset-auto");
-  return section;
+  const stop=btn("停止 TTS 模型",async()=>{
+    const p=await api("tts/resident");
+    if(p.kind==="tts")await api("tts/stop","POST",{id:p.id});
+    if(status.isConnected)refresh();
+  },{disabled:true});
+  async function refresh(){
+    try{
+      const p=await api("tts/resident");
+      status.textContent=p.id?"常駐中："+residentName(p):p.busy?"正在處理作業。":"目前無常駐模型。";
+      stop.disabled=p.kind!=="tts"||p.busy;
+    }catch(e){status.textContent=e.message}
+    start.disabled=false;
+  }
+  refresh();
+  return box("stack",status,box("actions",start,stop));
 }
-
-
 function synthesis() {
   const k = draft.engine,
     settings = d(),
@@ -951,8 +886,15 @@ function synthesis() {
       }
     },
   });
+  const source = [];
   const right = [box("row", field("工作模式", modeCtrl), ...(engine.speed ? [field("語速", speed)] : []))];
-  if (k === "gpt-sovits") {
+  const gptModel = k === "gpt-sovits" ? gptVariant(settings,engine) : "";
+  if (k === "gpt-sovits" && engine.variants.length > 1) {
+    right.push(field("GPT-SoVITS 基礎版本", select(Object.fromEntries(engine.variants.map(v=>
+      [v,variantName(v)+(engine.availableVariants?.includes(v)?"":"（未就緒）")])),gptModel,
+      v=>{update("variant",v);render();},"gpt-variant")));
+  }
+  if (gptModel === "v2Pro") {
     const selected = selectedTrainedModel(settings);
     right.push(
       field("GPT-SoVITS 模型", select(modelOptions("v2Pro 基礎模型", selected), selected, (id) => {
@@ -960,15 +902,26 @@ function synthesis() {
         update("modelProject", id);
         render();
       }, "trained-model")),
-      btn("重新偵測微調模型", async () => {
-        trainedModels = await api("trained-models");
-        render();
-      }),
+      box("actions",
+        btn("匯入微調模型 ZIP", () => showModelImport(model => {
+          settings.modelVoice = draft.voiceId || "";
+          update("modelProject", model.id);
+          persist();
+        })),
+        ...(selectedVoice() && selected && !selectedVoice().modelProjects?.includes(selected) ? [
+          btn("將所選模型加入此角色", async () => {
+            const voice = selectedVoice();
+            const updated = await api("profiles/"+voice.id,"PUT",{...voice,modelProjects:[...(voice.modelProjects||[]),selected]});
+            voices = voices.map(item=>item.id===updated.id?updated:item);
+            render();
+            notice("已連結「"+updated.name+"」；可在聲音庫設定預設模型。");
+          })
+        ] : [])),
     );
   }
   if (mode.reference) {
     if (voices.length)
-      right.push(field("角色", select(
+      source.push(field("角色", select(
         { "": "單次錄音", ...Object.fromEntries(voices.map((voice) => [voice.id, voice.name])) },
         draft.voiceId || "",
         (value) => {
@@ -983,18 +936,18 @@ function synthesis() {
         },
         "voice",
       )));
-    if (voices.length) right.push(box("voice-choices",...voices.map(voice=>{
+    if (voices.length) source.push(box("voice-choices",...voices.map(voice=>{
       const b=btn("",()=>{useVoice(voice);const asr=speakerASR(k,settings);if(!asr.text&&!asr.pending&&!asr.manual)recognizeReference(asr);persist();render()},
         {"aria-pressed":String(draft.voiceId===voice.id),"aria-label":"選擇角色 "+voice.name,title:voice.name,className:"voice-choice"});
       b.append(avatarIcon(voice),el("span",{},voice.name));return b;
     })));
-    right.push(field("參考錄音", el("span", { className: "filebtn" }, ref)));
+    source.push(field("參考錄音", el("span", { className: "filebtn" }, ref)));
     if (engine.minReference)
-      right.push(hint(`使用 ${engine.minReference} 至 ${engine.maxReference} 秒的單人錄音。`));
+      source.push(hint(`使用 ${engine.minReference} 至 ${engine.maxReference} 秒的單人錄音。`));
     else if (engine.maxReference)
-      right.push(hint(`使用最多 ${engine.maxReference} 秒的清晰單人錄音。`));
+      source.push(hint(`使用最多 ${engine.maxReference} 秒的清晰單人錄音。`));
     if (draft.reference)
-      right.push(
+      source.push(
         el("p", { className: "file-name" }, draft.referenceName || "已匯入錄音"),
         el("audio", {
           controls: true,
@@ -1003,12 +956,13 @@ function synthesis() {
         }),
       );
   }
-  if (mode.reference)
-    right.push(asrPanel("reference-asr", speakerASR(k, settings), {
+  if (mode.reference && draft.reference)
+    source.push(asrPanel("reference-asr", speakerASR(k, settings), {
       textID: "transcript", languageID: "refLang",
       textLabel: "參考逐字稿",
       hint: mode.transcript ? "" : "此模式只用參考音訊；逐字稿只供查看與校對。",
     }));
+  else if (mode.reference) source.push(hint("匯入錄音後，可揀語言並自動辨識逐字稿。"));
   if (mode.instruction || mode.style)
     right.push(
       field(
@@ -1060,25 +1014,29 @@ function synthesis() {
     gap,field("合併輸出",el("input",{type:"checkbox",checked:!settings.splitSeparate,onchange:e=>{update("splitSeparate",!e.target.checked);gap.hidden=!e.target.checked}})));
   splitFields.hidden = !settings.splitEnabled;
   const splitting=el("label",{className:"dataset-option"},el("input",{type:"checkbox",checked:!!settings.splitEnabled,onchange:e=>{update("splitEnabled", e.target.checked);splitFields.hidden=!e.target.checked;}}),"切分生成");
-  const left = card("朗讀台詞", field("要讀出的文字", script), splitting, splitFields, controls);
-  if (!canRun(engine, mode))
+  const left = card("2 · 朗讀台詞", field("要讀出的文字", script), el("details",{},el("summary",{},"切分及輸出設定"),splitting,splitFields), box("studio-generate",el("strong",{},"3 · 生成"),controls));
+  if (!canRun(engine, mode, gptModel || mode.variant))
     left.append(
       box(
         "actions",
-        hint(mode.variant ? "合成前請先安裝 " + mode.variant + " 模型。" : "合成前請先連接引擎。"),
+        hint(gptModel || mode.variant ? "合成前請先連接 " + variantName(gptModel || mode.variant) + " 模型。" : "合成前請先連接引擎。"),
         btn("前往模型管理", () => setTab("models")),
       ),
     );
-  $("work").replaceChildren(box("grid", left, card(mode.variant || engine.variants.join(" · "), ...right)));
+  const setup=card("1 · 角色及參考",...(source.length?source:[hint("呢個模式毋須參考錄音。可喺右邊調整所需設定。")]));
+  const inspector=card("引擎設定",hint(variantName(gptModel || mode.variant)||engine.variants.map(variantName).join(" · ")),...right,
+    el("details",{open:true},el("summary",{},"常駐及停止模型"),ttsResidentPanel(selectedTTS(k,settings,engine,mode))));
+  $("work").replaceChildren(box("studio-editor",box("stack studio-main",setup,left),box("studio-inspector",inspector)));
 }
-function emotionFields(kind, settings, update) {
+function emotionFields(kind, settings, update, options = {}) {
   const fields = [];
   if (kind === "audio") {
     const input = el("input", {
-      type: "file", accept: mediaAccept, id: "emotion-reference",
+      type: "file", accept: mediaAccept, id: options.id ?? "emotion-reference",
       onchange: async (event) => {
         const file = event.target.files[0];
         if (!file) return;
+        if (options.upload) return options.upload(file);
         const upload = ++emotionUploadTicket;
         try {
           const ref = await api("reference", "POST", file);
@@ -1101,7 +1059,7 @@ function emotionFields(kind, settings, update) {
       hint(settings.emotionName || "已匯入情緒錄音"),
       el("audio", { controls: true, preload: "none", src: "/api/reference/" + settings.emotionReference }),
     );
-    fields.push(asrPanel("emotion-asr", emotionASR(settings), {
+    if (!options.upload) fields.push(asrPanel("emotion-asr", emotionASR(settings), {
       languageLabel: "情緒錄音語言", textLabel: "情緒錄音逐字稿",
       hint: "只供查看與校對，不會送入情緒合成。",
     }));
@@ -1146,11 +1104,18 @@ async function submit(preview) {
     payload.splitSeparate=!!s.splitSeparate;
   }
   if (mode.variant) payload.variant = mode.variant;
-  if (k === "gpt-sovits") payload.modelProject = selectedTrainedModel(s);
+  if (k === "gpt-sovits") {
+    payload.variant = gptVariant(s,engine);
+    if(payload.variant==="v2Pro") payload.modelProject = selectedTrainedModel(s);
+    payload.useBaseModel = !payload.modelProject;
+  }
   if (mode.speaker) payload.speaker = s.speaker || engine.speakers[0];
   if (mode.emotion) payload.emotionStrength = s.emotionStrength ?? 1;
   if (mode.emotion === "audio") payload.emotionReference = s.emotionReference || "";
   if (mode.emotion === "vector") payload.emotionWeights = s.emotionWeights || Array(8).fill(0);
+  const resident=await api("tts/resident");
+  const target=selectedTTS(k,s,engine,mode);
+  if(resident.id&&!sameTTS(resident,target) && !await startResidentTTS(target))return;
   persist();
   currentJob = await api("synthesize", "POST", payload);
   showJob();
@@ -1220,10 +1185,7 @@ function voiceLibrary() {
       controls: true, preload: "metadata", src: "/api/reference/" + voice.reference,
     })] : []),
     asrPanel("voice", profileASR(voice)),
-    field("GPT-SoVITS 模型", select(
-      modelOptions("v2Pro 基礎模型", voice.modelProject), voice.modelProject || "",
-      (id) => { voice.modelProject = id; }, "voice-trained-model",
-    )),
+    profileModelControls(voice),
     box("actions",
       btn("儲存角色", async () => {
         const saved = await api(voice.id ? "profiles/" + voice.id : "profiles", voice.id ? "PUT" : "POST", voice);
@@ -1252,137 +1214,20 @@ function voiceLibrary() {
   }));
   $("work").replaceChildren(box("grid", list, edit));
 }
-async function training() {
-  const mark = renderID;
-  const manual = box("training-manual", hint("正在讀取訓練專案…"));
-  $("work").replaceChildren(autoDatasetPanel(), manual);
-  drawDatasetFiles();
-  loadDatasetHistory(mark);
-  try {
-    const projects = await api("training");
-    if (mark !== renderID) return;
-    const projectsCard = card(
-      "訓練專案",
-      ...projects.map((project) => btn(project.name, () => {
-        trainingProject = structuredClone(project);
-        render();
-      }, { "aria-pressed": String(project.id === trainingProject?.id) })),
-      btn("新增專案", () => {
-        trainingProject = { name: "", clips: [] };
-        render();
-      }, { className: "primary" }),
-    );
-    if (!trainingProject) {
-      manual.replaceChildren(projectsCard);
-      return;
-    }
-    const project = trainingProject;
-    const asrModel = el("input", {
-      type: "text", placeholder: "使用 GPT-SoVITS 內的 faster-whisper-large-v3",
-    });
-    const editor = card(
-      "片段與逐字稿",
-      field("專案名稱", el("input", {
-        type: "text", value: project.name, maxLength: 80,
-        oninput: (event) => { project.name = event.target.value; },
-      })),
-      field("加入 PCM16 WAV", el("input", {
-        type: "file", accept: mediaAccept, multiple: true,
-        onchange: async (event) => {
-          try {
-            for (const file of event.target.files) {
-              const ref = await api("reference", "POST", file);
-              project.clips.push({
-                reference: ref.id, sourceName: file.name, startMs: 0, endMs: Math.floor(ref.seconds * 1000),
-                language: "yue", transcript: "", use: "pending",
-              });
-            }
-          } catch (err) {
-            notice(err);
-          }
-          if (trainingProject === project && panel() === "training") training();
-        },
-      })),
-      ...project.clips.map((clip, index) => trainingClipFields(project, clip, index)),
-      box("actions",
-        btn("儲存專案", async () => {
-          const saved = await api(project.id ? "training/" + project.id : "training",
-            project.id ? "PUT" : "POST", project);
-          if (trainingProject !== project || panel() !== "training") return;
-          trainingProject = saved;
-          await training();
-          notice("訓練專案已儲存。");
-        }, { className: "primary" }),
-        ...(project.id && project.clips.some((clip) => clip.use === "train") ? [
-          el("a", { className: "linkbtn", href: "/api/training/" + project.id + "/dataset", download: "" },
-            "匯出已儲存的資料集"),
-        ] : []),
-      ),
-    );
-    if (project.id && project.clips.some((clip) => clip.use === "pending" && !clip.transcript)) {
-      editor.append(
-        field("本機轉錄模型（可選）", asrModel),
-        btn("轉錄已儲存的空白片段", async () => {
-          currentJob = await api("training/" + project.id + "/transcribe", "POST", {
-            revision: project.revision,
-            modelPath: asrModel.value.trim(),
-          });
-          showJob();
-        }),
-      );
-    }
-    manual.replaceChildren(box("grid", projectsCard, editor));
-  } catch (err) {
-    if (mark === renderID) notice(err);
-  }
-}
-function trainingClipFields(project, clip, index) {
-  const millis = (key) => el("input", {
-    type: "number", step: 1, min: 0, value: clip[key],
-    oninput: (event) => { clip[key] = event.target.valueAsNumber; },
-  });
-  const options = { ...referenceLanguages };
-  delete options.auto;
-  return card(
-    clip.sourceName || "參考錄音",
-    box("row", field("開始毫秒", millis("startMs")), field("結束毫秒", millis("endMs"))),
-    box("row",
-      field("語言", select(options, clip.language, (value) => { clip.language = value; }, "clip-lang-" + index)),
-      field("用途", select(
-        { pending: "待校對", train: "採用作訓練", holdout: "保留作試聽", skip: "剔除" },
-        clip.use, (value) => { clip.use = value; }, "clip-use-" + index,
-      )),
-    ),
-    field("逐字稿", area("clip-text-" + index, clip.transcript, "請輸入該片段的實際對白",
-      (value) => { clip.transcript = value; })),
-    ...(project.id && clip.id ? [
-      hint("上次儲存的片段"),
-      el("audio", {
-        controls: true, preload: "none",
-        src: "/api/training/" + project.id + "/clip/" + clip.id + "?revision=" + project.revision,
-      }),
-    ] : []),
-    box("actions",
-      ...(clip.use === "pending" && !clip.transcript ? [
-        btn("按停頓自動切片", async () => {
-          const split = await api("training/split", "POST", clip);
-          if (trainingProject !== project) return;
-          const position = project.clips.indexOf(clip);
-          if (position < 0) return;
-          if (project.clips.length - 1 + split.length > 300) throw Error("每個專案最多 300 個片段。");
-          project.clips.splice(position, 1, ...split);
-          if (panel() === "training") render();
-        }),
-      ] : []),
-      btn("複製片段範圍", () => {
-        const copy = { ...clip, transcript: "", use: "pending" };
-        delete copy.id;
-        project.clips.splice(index + 1, 0, copy);
-        render();
-      }),
-      btn("移除片段", () => { project.clips.splice(index, 1); render(); }),
-    ),
-  );
+function profileModelControls(voice) {
+  const keys = [...new Set([voice.modelProject, ...(voice.modelProjects||[])].filter(Boolean))];
+  const attached = {"":"v2Pro 基礎模型"};
+  for (const key of keys) attached[key] = trainedModels.find(m=>m.id===key)?.name || "找不到已連結的模型";
+  const available = trainedModels.filter(m=>!keys.includes(m.id));
+  return box("stack",
+    field("預設 GPT-SoVITS 模型",select(attached,voice.modelProject||"",key=>{voice.modelProject=key;},"voice-trained-model")),
+    ...(keys.length ? keys.map(key=>box("model-binding",el("span",{},attached[key]),
+      btn("解除連結",()=>{voice.modelProjects=keys.filter(x=>x!==key);if(voice.modelProject===key)voice.modelProject="";render();}))) :
+      [hint("此角色未連結微調模型。")]),
+    ...(available.length ? [field("加入另一個微調模型",select(
+      {"":"選擇要加入的模型",...Object.fromEntries(available.map(m=>[m.id,m.name]))},"",key=>{
+        if(key){voice.modelProjects=[...keys,key];render();}
+      },"voice-add-model"))] : []));
 }
 const upstreamEngineLinks = {
   "gpt-sovits": "https://huggingface.co/lj1995/GPT-SoVITS-windows-package/tree/main",
@@ -1485,7 +1330,7 @@ function models() {
   for (const variant of engine.variants) {
     const files = el("div", { className: "stack" });
     official.append(box("stack",
-      el("h3", {}, variant),
+      el("h3", {}, variantName(variant)),
       hint(engine.availableVariants?.includes(variant) ? "已找到模型檔案" : "未安裝此模型"),
       downloadControl(k, "model", "下載模型", variant),
       files,
@@ -1496,7 +1341,7 @@ function models() {
             hint([item.version || item.id, item.provider, item.source === "bundle" ? "原整合包" : ""]
               .filter(Boolean).join(" · ")),
             box("actions", btn("刪除模型", async () => {
-              if (!window.confirm("刪除 " + variant + " 模型權重？錄音及生成紀錄會保留。")) return;
+              if (!window.confirm("刪除 " + variantName(variant) + " 模型權重？錄音及生成紀錄會保留。")) return;
               await api("installed-models/" + k + "/" + encodeURIComponent(variant) + "/" + item.id
                 + "?source=" + item.source, "DELETE");
               await refreshAssets("已刪除模型權重，錄音及紀錄已保留。");
@@ -1541,11 +1386,37 @@ function models() {
   );
   const trained = [];
   if (k === "gpt-sovits") {
+    const v5Path = el("input", {type:"text", id:"gpt-v5-runtime", placeholder:engine.gptV5Path || "D:\\Engines\\GPT-SoVITS-V5"});
+    trained.push(card("連接 GPT-SoVITS V5",
+      hint(engine.gptV5Installed ? "已連接獨立 V5 引擎。唔會取代 v2Pro。" : "V5 Turbo 同 V5 Dev 用獨立引擎。連接後可下載或使用已校驗權重。"),
+      ...(engine.gptV5Path?[el("p",{className:"path"},engine.gptV5Path)]:[]),
+      field("V5 引擎資料夾",v5Path),box("actions",
+        btn("驗證並連接 V5",async()=>{
+          if(!v5Path.value.trim())throw Error("請輸入 V5 引擎資料夾。");
+          await api("engine","POST",{engine:k,variant:"v5",path:v5Path.value.trim()});
+          await refreshAssets("已連接 GPT-SoVITS V5。");
+        }),
+        ...(engine.gptV5Path?[btn("解除 V5 連接",async()=>{
+          await api("engine","POST",{engine:k,variant:"v5",path:""});
+          await refreshAssets("已解除 V5 連接；原始資料夾同 v2Pro 都保留。");
+        })]:[]))));
+  }
+  if (k === "gpt-sovits" && gptVariant(d(),engine) === "v2Pro") {
     trained.push(card(
       "微調模型",
       btn("訓練角色模型", () => setTab("training")),
+      btn("匯入微調模型 ZIP", () => showModelImport()),
       ...(trainedModels.length ? trainedModels.map((model) => box("stack", hint(model.name),
-        box("actions", btn("刪除微調模型", async () => {
+        box("actions",
+        el("a",{className:"linkbtn",href:"/api/trained-models/"+model.id+"/download",download:""},"下載 ZIP"),
+        btn("改名",async()=>{
+          const name = window.prompt("微調模型名稱",model.name);
+          if (name?.trim() && name.trim()!==model.name) {
+            await api("trained-models/"+model.id,"PATCH",{name:name.trim()});
+            await refreshAssets("微調模型已改名。");
+          }
+        }),
+        btn("刪除微調模型", async () => {
           if (!window.confirm("刪除「" + model.name + "」的生成權重與訓練檢查點？專案、素材及紀錄會保留。")) return;
           await api("trained-models/" + model.id, "DELETE");
           await refreshAssets("已刪除微調權重，專案及素材已保留。");
@@ -1560,9 +1431,18 @@ function models() {
 
 async function storageSettings() {
   const mark = renderID;
-  const choice=card("本機語音辨識",field("預設辨識模型",asrModelPicker(saveASRChoice)),
+  const about=card("關於 TimbreDeck",hint(studioBuild ?
+    "版本 "+studioBuild.version+" · 建置 "+studioBuild.id : "啟動程式未回報建置資料。"));
+  const choice=card("工作室偏好",
+    trainingToggle("減少介面動效及視差",!!draft.reduceMotion,v=>{
+      draft.reduceMotion=v;
+      document.body.dataset.motion=v?"reduce":"system";
+      if(v)$("work").getAnimations().forEach(a=>a.cancel());
+      scheduleDepth();changed();
+    }),
+    field("預設辨識模型",asrModelPicker(saveASRChoice)),
     btn("重新偵測模型",async()=>{asrOptions=await api("asr/models");render()}));
-  $("work").replaceChildren(choice,hint("正在讀取錄音…"));
+  $("work").replaceChildren(choice,about,hint("正在讀取錄音…"));
   try {
     const [unused, outputs] = await Promise.all([api("unused-recordings"), api("history")]);
     if (mark !== renderID) return;
@@ -1600,92 +1480,9 @@ async function storageSettings() {
         })),
       )) : [hint("沒有已生成的錄音。")]),
     );
-    $("work").replaceChildren(choice,box("grid", reference, generated));
+    $("work").replaceChildren(choice,about,box("grid", reference, generated));
   } catch (err) {
     if (mark === renderID) $("work").replaceChildren(hint(err.message));
-  }
-}
-async function history() {
-  const mark = renderID;
-  $("work").replaceChildren(hint("正在讀取輸出…"));
-  try {
-    const files = await api("history");
-    if (mark !== renderID) return;
-    const content = files.map((x) =>
-      card(
-        catalog[x.input.engine][0] + (x.input.preview ? " · 試讀" : " · 全文"),
-        el(
-          "p",
-          { className: "meta" },
-          new Date(x.created).toLocaleString("zh-HK") +
-            "　" +
-            x.seconds.toFixed(1) +
-            " 秒" + (x.sampleRate ? "　" + x.sampleRate + " Hz" : ""),
-        ),
-        hint([x.voiceName, x.model || x.input.variant, x.packVersion].filter(Boolean).join(" · ") || "預覽版記錄"),
-        hint(x.verifiedCuda ? "已核對波形及主模型：" + x.verifiedCuda : "未有完整 CUDA 作業證據"),
-        el("p", { className: "history-text" }, x.input.text),
-        el("details", {},
-          el("summary", {}, "合成設定"),
-          hint([
-            engines[x.input.engine]?.modes?.find((mode) => mode.id === x.input.mode)?.label,
-            lang[x.input.language],
-            x.input.speaker,
-            x.input.speed && x.input.speed + " ×",
-            x.input.emotionStrength != null && "情緒強度 " + x.input.emotionStrength,
-          ].filter(Boolean).join(" · ")),
-          ...(x.input.transcript ? [hint("逐字稿　" + x.input.transcript)] : []),
-          ...(x.input.instruction ? [hint("指示　" + x.input.instruction)] : []),
-        ),
-        x.audioAvailable ? box(
-          "history-actions",
-          el("audio", {
-            controls: true,
-            preload: "none",
-            src: "/api/audio/" + x.id,
-          }),
-          el(
-            "a",
-            {
-              className: "linkbtn",
-              href: "/api/audio/" + x.id + "?download=1",
-              download: "",
-            },
-            "匯出 WAV",
-          ),
-          btn(historySelection.has(x.id) ? "取消比較" : "加入比較", () => {
-            if (historySelection.has(x.id)) historySelection.delete(x.id);
-            else {
-              if (historySelection.size >= 2) throw Error("請先取消其中一筆比較。");
-              historySelection.add(x.id);
-            }
-            history();
-          }),
-          btn("存為角色錄音", async () => {
-            const sample = await fetch("/api/audio/" + x.id);
-            if (!sample.ok) throw Error("找不到這段輸出音檔。");
-            const ref = await api("reference", "POST", await sample.blob());
-            editingVoice = {
-              name: x.voiceName || "",
-              reference: ref.id,
-              language: referenceLanguages[x.input.language] ? x.input.language : "auto",
-              transcript: x.input.text,
-            };
-            setTab("voices");
-          }),
-        ) : x.parts ? el("a",{href:"/api/audio/"+x.id+"/parts",className:"linkbtn"},"下載 "+x.parts+" 段 WAV（ZIP）") : hint("錄音已刪除"),
-      ),
-    );
-    $("work").replaceChildren(
-      ...(historySelection.size ? [
-        box("grid", ...content.filter((_, i) => historySelection.has(files[i].id))),
-      ] : []),
-      ...(content.length
-        ? content.filter((_, i) => !historySelection.has(files[i].id))
-        : [card("輸出歷史", hint("完成合成後，可在這裏試聽和匯出音檔。"))]),
-    );
-  } catch (e) {
-    if (mark === renderID) notice(e);
   }
 }
 function syncSynthesisControls() {
@@ -1695,79 +1492,82 @@ function syncSynthesisControls() {
   const busy = ["running", "cancelling"].includes(currentJob?.status);
   const asr = mode.transcript ? speakerASR(draft.engine, d()) : null;
   const waiting = asr?.pending && !asr.text;
-  buttons.forEach((button) => { button.disabled = busy || !canRun(engine, mode) || waiting; });
+  buttons.forEach((button) => { button.disabled = busy || !canRun(engine, mode, draft.engine==="gpt-sovits"?gptVariant(d(),engine):mode.variant) || waiting; });
 }
+const jobIsland={key:"",dismissed:"",resident:null};
 function showJob() {
-  const j = currentJob,
-    busy = j && ["running", "cancelling"].includes(j.status);
   syncSynthesisControls();
   cleanStatus();
   datasetControls();
-  const jobPanel = $("job");
-  if (!j) {
-    jobPanel.replaceChildren();
-    return;
+  syncTrainingControls();
+  const capturing=!!mic;
+  const j=capturing && currentJob?.kind==="sts-live"?null:currentJob;
+  const busy=jobActive(j),host=$("job");
+  const key=j ? [j.id,j.status,panel(),j.total||0,capturing].join(":") : capturing?"mic":"idle";
+  const compact=j?.id===jobIsland.dismissed && !busy;
+  if(key!==jobIsland.key) {
+    jobIsland.key=key;
+    const dot=el("span",{className:"activity-dot","aria-hidden":"true"});
+    if(j)dot.dataset.status=j.status;
+    const status=el("span",{className:"activity-status",role:"status",id:"job-status"});
+    const progress=el("progress",{id:"job-progress","aria-label":"作業進度",hidden:!busy});
+    const parts=el("span",{className:"activity-count",id:"job-count"});
+    const buttons=[];
+    if(busy) buttons.push(btn("取消作業",async()=>{
+      currentJob=await api("cancel/"+j.id,"POST");showJob();
+    },{disabled:j.status==="cancelling"}));
+    if(["synthesis","sts"].includes(j?.kind) && j.status==="done" && panel()!=="history")
+      buttons.push(btn("試聽及匯出",()=>setTab("history")));
+    if(j?.kind==="clean" && j.status==="done" && !cleanOpen)
+      buttons.push(btn("查看清理結果",()=>setTab("clean")));
+    if(["dataset","training","auto-training"].includes(j?.kind) && ["done","failed"].includes(j.status) && panel()!=="training")
+      buttons.push(btn("查看訓練結果",()=>setTab("training")));
+    if(capturing)buttons.push(btn("停止收音",()=>stopMic()));
+    else if(j && !busy)buttons.push(btn("收起",()=>{jobIsland.dismissed=j.id;showJob()}));
+    host.replaceChildren(dot,status,progress,parts,...buttons);
   }
-  const states = {
-    running: "進行中",
-    cancelling: "正在取消",
-    cancelled: "已取消",
-    done: "已完成",
-    failed: "失敗",
-  };
-  const nodes = [
-    (j.kind === "clean" ? cleanWorkspace[0] : catalog[j.engine]?.[0] || "工作室") +
-      " · " +
-      ({ install: "安裝", synthesis: "語音合成", transcription: "素材轉錄", clean: "音檔清理", dataset: "建立訓練資料集" }[j.kind] || j.kind) +
-      " · " +
-      states[j.status],
-  ];
-  if (j.detail && j.status !== "cancelled") nodes.push("　" + j.detail);
-  if (busy && j.total > 1) nodes.push(el("progress",{max:j.total,value:j.completed||0,"aria-label":"分段生成進度"}),`${j.completed||0}/${j.total} 段`);
-  else if (busy && j.status==="running") nodes.push(el("progress",{"aria-label":"作業進行中，未有百分比"}));
-  if (busy)
-    nodes.push(
-      btn(
-        "取消作業",
-        async () => {
-          currentJob = await api("cancel/" + j.id, "POST");
-          showJob();
-        },
-        { disabled: j.status === "cancelling" },
-      ),
-    );
-  if (j.kind === "synthesis" && j.status === "done" && d().tab !== "history")
-    nodes.push(btn("試聽及匯出", () => setTab("history")));
-  if (j.kind === "clean" && j.status === "done" && !cleanOpen)
-    nodes.push(btn("查看清理結果", () => setEngine("clean")));
-  if (j.kind === "dataset" && j.status === "done" && panel() !== "training")
-    nodes.push(btn("查看資料集", () => {
-      draft.engine = "gpt-sovits";
-      setTab("training");
-    }));
-  if (j.kind === "transcription" && j.status === "done" && !cleanOpen && d().tab === "training")
-    nodes.push("　重新選取專案以查看建議逐字稿。");
-  jobPanel.replaceChildren(...nodes);
+  host.hidden=!!compact || !j && !jobIsland.resident?.id && !mic;
+  const states={running:"進行中",cancelling:"正在取消",cancelled:"已取消",done:"已完成",failed:"失敗"};
+  const labels={install:"安裝",synthesis:"語音合成",transcription:"素材轉錄",clean:"音檔清理",
+    dataset:"建立訓練資料集",training:"微調訓練","auto-training":"一鍵生成及訓練","tts-warm":"常駐預載",sts:"STS 語音轉換","sts-live":"即時收音","sts-warm":"STS 預熱"};
+  const resident=jobIsland.resident;
+  const message=[
+    j ? [labels[j.kind]||j.kind,states[j.status]||j.status,j.detail,j.warning].filter(Boolean).join(" · ") : "",
+    resident?.id ? "常駐："+residentName(resident) : "",
+    mic ? "咪高峰收音中" : "",
+  ].filter(Boolean).join("　");
+  if($("job-status").textContent!==message)$("job-status").textContent=message;
+  const progress=$("job-progress");
+  if(busy && j.total>0){
+    progress.max=j.total;progress.value=j.completed||0;
+    $("job-count").textContent=(j.completed||0)+"/"+j.total+" 段";
+  }else{
+    progress.removeAttribute("value");
+    $("job-count").textContent="";
+  }
 }
 async function poll() {
+  if(studioExited) return;
+  if (studioExitPending) { setTimeout(poll,1200); return; }
   try {
-    const j = await api("job");
-    if (JSON.stringify(j) !== JSON.stringify(currentJob)) {
-      currentJob = j;
-      if (j?.status === "done" && j.kind === "install") {
-        engines = (await api("state")).engines;
-        render();
-      } else {
-        showJob();
-        if (j?.status === "done" && j.kind === "clean" && cleanOpen) loadCleanHistory();
-        if (j?.status === "done" && j.kind === "dataset" && panel() === "training") loadDatasetHistory();
-        if (j?.status === "done" && panel() === "history") history();
+    const [j,resident]=await Promise.all([api("job"),api("tts/resident").catch(()=>null)]);
+    if(studioExited) return;
+    if(resident)jobIsland.resident=resident;
+    const changed=JSON.stringify(j)!==JSON.stringify(currentJob);
+    if(changed){
+      currentJob=j;
+      if(j?.status==="done" && j.kind==="install"){
+        engines=(await api("state")).engines;
+        if(["models","synth"].includes(panel()))render();
       }
+      if(j?.status==="done" && j.kind==="clean" && cleanOpen)loadCleanHistory();
+      trainingJobChanged(j).catch(notice);
+      if(j?.status==="done" && ["synthesis","sts"].includes(j.kind) && panel()==="history") history(j.id);
+      onSTSJob(j);
     }
-  } catch (e) {
-    notice("與本機啟動器的連線中斷，請確認 Start.exe 仍在執行。");
-  }
-  setTimeout(poll, 1200);
+    showJob();
+  }catch(e){if(!studioExitPending && !studioExited) notice("與本機工作室嘅連線中斷，請確認啟動程式仍在執行。")}
+  if(!studioExited)setTimeout(poll,1200);
 }
 let arenaOpen="";
 let asrOptions=[{id:"",name:"自動（推薦）",status:"ready",note:"有可用模型時會按語言選擇。"}];
@@ -1776,120 +1576,129 @@ function saveASRChoice(model){asrChoice=model;draft.asrModel=model;persist()}
 function avatarIcon(voice){
   return voice.avatar?el("img",{className:"avatar",src:"/api/avatars/"+voice.avatar,alt:""}):el("span",{className:"avatar avatar-initial","aria-hidden":"true"},Array.from(voice.name||"?").slice(0,1).join(""));
 }
-function asrModelPicker(commit){
+function asrModelPicker(commit,current=asrChoice,label="辨識模型"){
   const input=el("select"),desc=hint("");
   for(const m of asrOptions)input.append(el("option",{value:m.id,disabled:m.status!=="ready",title:m.note},m.name+(m.status==="ready"?"":m.status==="missing"?"（未安裝）":"（待整合）")));
-  input.value=asrChoice;
+  input.value=current;
+  input.setAttribute("aria-label",label);
   if(input.selectedIndex<0)input.value="";
   const describe=()=>{desc.textContent=asrOptions.find(m=>m.id===input.value)?.note||"";input.title=desc.textContent};
   input.onchange=()=>{describe();commit(input.value)};
   const guide=el("details",{},el("summary",{},"比較模型"),...asrOptions.filter(m=>m.id).map(m=>el("p",{title:m.note},el("strong",{},m.name+"："),m.note)));
   describe();return box("model-choice",input,desc,guide);
 }
-function drawSections(){
-  const tab=panel(), classify=(x)=>!arenaOpen&&!cleanOpen&&tab===x;
-  const nav=(label,on,fn)=>btn(label,fn,{"aria-current":on?"page":"false"});
-  $("sections").replaceChildren(
-    el("small",{},"工作區"),
-    nav("語音合成",classify("synth"),()=>setTab("synth")),
-    nav("聲音庫",classify("voices"),()=>setTab("voices")),
-    nav("去去除雜聲",!arenaOpen&&cleanOpen,()=>setEngine("clean")),
-    nav("訓練素材",classify("training"),()=>{setEngine("gpt-sovits");setTab("training")}),
-    el("small",{},"比較"),
-    nav("TTS 擂臺",arenaOpen==="tts",()=>{arenaOpen="tts";render()}),
-    nav("ASR 擂臺",arenaOpen==="asr",()=>{arenaOpen="asr";render()}),
-    el("small",{},"管理"),
-    nav("模型管理",classify("models"),()=>setTab("models")),
-    nav("輸出歷史",classify("history"),()=>setTab("history")),
-    nav("設定",classify("storage"),()=>setTab("storage")));
-  $("engine-open").textContent=(catalog[draft.engine]?.[0]||"合成引擎")+" ▾";
+const sts={model:"cosyvoice3"};
+const stsNames={cosyvoice3:"CosyVoice 3","x-vc":"X-VC","seed-vc-tiny":"Seed-VC Tiny",meanvc2:"MeanVC 2",tvtsyn1:"TVTSyn1"};
+function stsStatus(message){
+  sts.message=message;
+  if($("sts-audio-status"))$("sts-audio-status").textContent=message;
 }
-const arena = Object.fromEntries(["tts","asr"].map(k=>[k,{lang:"en",choose:new Set(),rows:[]}]));
-function drawArena(){
-  const k=arenaOpen, state=arena[k], flags=k==="asr"?asrOptions.filter(x=>x.id&&x.status==="ready"):Object.keys(engines).filter(x=>engines[x].ready).map(id=>({id,name:catalog[id]?.[0]||id,note:"使用錄音複製模式；Qwen 使用 Base。"}));
-  const refresh=()=>{if(arenaOpen===k)drawArena()};
-  const file=el("input",{type:"file",accept:mediaAccept,disabled:!!state.busy,onchange:async e=>{
-    const f=e.target.files[0];if(!f)return;
-    state.loading=true;state.error="";refresh();
-    try{const r=await api("reference","POST",f);state.ref=r.id;state.file=f.name}catch(err){state.error=err.message}finally{state.loading=false;refresh()}
-  }});
-  const langSelect=select(referenceLanguages,state.lang,v=>{state.lang=v},"arena-language");
-  langSelect.disabled=!!state.busy;
-  const fields=[field("共同錄音",file),hint(state.file||"選擇一個要比較的音檔。"),field("錄音語言",langSelect)];
-  if(k==="tts"){
-    fields.push(field("共同台詞",area("arena-text",state.text||"","要朗讀的句子",v=>{state.text=v})),field("參考逐字稿（留空會自動辨識）",area("arena-transcript",state.transcript||"","參考錄音中的實際對白",v=>{state.transcript=v})));
-    const out=select(referenceLanguages,state.output||"en",v=>{state.output=v},"arena-output");out.disabled=!!state.busy;fields.push(field("輸出台詞語言（引擎支援時）",out));
+function drawSTS(){
+  const slots=[["source","來源錄音 · 1–25 秒"],["reference","目標音色參考 · 2–20 秒"]];
+  if(!sts.models&&!sts.catalogPending){
+    sts.catalogPending=true;
+    api("sts/models").then(rows=>{sts.models=rows;if(arenaOpen==="sts")drawSTS()})
+      .catch(err=>{stsStatus("未能讀取 STS 模型："+err.message)})
+      .finally(()=>{sts.catalogPending=false});
   }
-  const sets=box("arena-models",...flags.map(({id,name,note})=>el("label",{title:note,className:"dataset-option"},el("input",{type:"checkbox",checked:state.choose.has(id),disabled:!!state.busy,onchange:e=>{if(e.target.checked)state.choose.add(id);else state.choose.delete(id);refresh()}}),name)));
-  const results=state.rows.map(r=>box("arena-result",el("h3",{},r.name),
-    r.error?hint(r.error):k==="asr"?el("p",{},r.text||"沒有辨識到對白"):el("audio",{src:"/api/audio/"+r.job,preload:"none",controls:true}),
-    !r.error?hint((r.elapsed??0).toFixed(1)+" 秒"+(r.model?" · "+r.model:"")):hint(""),
-    r.warning?hint(r.warning):hint(""),r.job?el("a",{className:"linkbtn",href:"/api/audio/"+r.job+"?download=1"},"下載 WAV"):el("span")));
-  $("work").replaceChildren(box("grid",card("設定共同條件",...fields,sets,
-    btn("開始比較",()=>runArena(k,flags),{className:"primary",disabled:!!(state.busy||state.loading||!state.ref||state.choose.size<2)}),
-    state.error?hint(state.error):hint(state.busy?"按次序執行；無需同時載入模型。":"請選至少兩款模型。"),
-    state.busy?el("progress",{max:state.choose.size,value:state.rows.length,"aria-label":"擂臺進度"}):el("span")),card("比較結果",...results)));
-}
-async function runArena(k,flags){
-  const s=arena[k],models=flags.filter(m=>s.choose.has(m.id));
-  if(s.busy||!s.ref||models.length<2)return;
-  const text=(s.text||"").trim(),language=s.lang,output=s.output||"en",reference=s.ref;
-  if(k==="tts"&&!text){s.error="請先填寫共同台詞。";drawArena();return}
-  s.busy=true;s.rows=[];s.error="";drawArena();
-  try{
-    let transcript=(s.transcript||"").trim();
-    if(k==="tts"&&!transcript&&models.some(x=>engines[x.id]?.modes.find(m=>m.id==="clone")?.transcript))
-      transcript=(await api("asr","POST",{reference,language,...(asrChoice?{model:asrChoice}:{})})).text;
-    for(const m of models){
-      const begin=performance.now();const r={name:m.name};
-      try {
-        if(k==="asr"){
-          const ans=await api("asr","POST",{reference,language,model:m.id});
-          Object.assign(r,{text:ans.text,model:ans.model||ans.provider,warning:(ans.warning||"")+(ans.cached?"（快取）":"")});
-        }else{
-          const mode=engines[m.id].modes.find(m=>m.id==="clone");
-          const q={engine:m.id,mode:"clone",text,reference,speed:1,preview:false};
-          if(mode.transcript)q.transcript=transcript;
-          if(mode.languages)q.language=m.id==="qwen3-tts"&&output==="yue"?"zh":output;
-          if(m.id==="gpt-sovits")q.refLang=language;
-          const job=await api("synthesize","POST",q);
-          let done=false;
-          for(let i=0;i<1440;i++){const x=await api("job");if(x?.id!==job.id)throw Error("工作室已開始另一項作業。");if(x.status==="done"){done=true;break}if(!["running","cancelling"].includes(x.status))throw Error(x.detail||x.status);await new Promise(ok=>setTimeout(ok,1000))}
-          if(!done)throw Error("等待逾時；請到輸出歷史查看。");
-          r.job=job.id;if(m.id==="qwen3-tts"&&output==="yue")r.warning="Qwen Base 使用中文，沒有獨立粵語選項。";
-        }
-      }catch(e){r.error=e.message}
-      r.elapsed=(performance.now()-begin)/1000;s.rows.push(r);if(arenaOpen===k)drawArena();
-    }
-  }catch(e){s.error=e.message}
-  finally{s.busy=false;if(arenaOpen===k)drawArena()}
-}
-(async () => {
-  try {
-    const [state, profiles, models, choices] = await Promise.all([api("state"), api("profiles"), api("trained-models"),api("asr/models").catch(()=>null)]);
-    if(choices)asrOptions=choices;
-    $("engine-open").onclick=()=>$("engine-dialog").showModal();
-    draft = state.draft;
-    asrChoice=asrOptions.some(x=>x.id===draft.asrModel&&x.status==="ready")?draft.asrModel:"";
-    engines = state.engines;
-    for(const k of Object.keys(engines))if(!catalog[k]){
-      const meta=engines[k];workspaces[k]=catalog[k]=[meta.title||k,meta.description||"本機語音合成引擎。"];
-    }
-    voices = profiles;
-    trainedModels = models;
-    if (draft.voiceId && !selectedVoice()) delete draft.voiceId;
-    draft.drafts ||= {};
-    if (!catalog[draft.engine]) draft.engine = "gpt-sovits";
-    for (const [k, v] of Object.entries(workspaces))
-      $("compact").add(new Option(v[0], k));
-    $("compact").onchange = (e) => setEngine(e.target.value);
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden && $("saved").textContent === "正在儲存草稿…")
-        persist();
+  const model=sts.models?.find(x=>x.id===sts.model);
+  const ready=model?.ready??(sts.model==="cosyvoice3"&&engines.cosyvoice3?.ready);
+  const micReady=model?.mic??sts.model==="cosyvoice3";
+  const selection=select(Object.fromEntries((sts.models||Object.entries(stsNames).map(([id,name])=>({id,name})))
+    .map(x=>[x.id,x.name+(x.ready===false?" · 未就緒":"")])),sts.model,value=>{
+      if(sts.running||sts.loading||sts.warming||mic)return;
+      stopSTSPreview();sts.model=value;sts.message="";sts.warmMessage="";sts.job=null;sts.result=null;drawSTS();
     });
-    render();
-    poll();
-  } catch (e) {
-    notice(e);
+  selection.id="sts-model";
+  selection.disabled=!!(mic||sts.running||sts.loading||sts.warming);
+  const isSeed=sts.model==="seed-vc-tiny";
+  const seedMode=()=>field("Seed-VC 錄音模式",select({"whole":"整段轉換","realtime":"原生即時分幀（300 ms）"},
+    sts.seedStreaming?"realtime":"whole",value=>{
+      sts.seedStreaming=value==="realtime";drawSTS();
+    },"sts-seed-mode"));
+  const inputs=slots.flatMap(([key,name])=>[
+    field(name,el("input",{id:"sts-"+key,type:"file",accept:mediaAccept,disabled:!!(sts.running||sts.loading),onchange:async(e)=>{
+      const f=e.target.files[0];if(!f)return;
+      sts.loading=true;drawSTS();
+      try{const data=await api("reference","POST",f);sts[key]={...data,name:f.name};sts.result=null;sts.job=null;stsStatus("")}
+      catch(err){stsStatus(err.message)}finally{sts.loading=false;if(arenaOpen==="sts")drawSTS()}
+    }})),
+    ...(sts[key]?[hint(sts[key].name+" · "+sts[key].seconds.toFixed(2)+" 秒"),
+      el("audio",{controls:true,preload:"none",src:"/api/reference/"+sts[key].id})]:[])
+  ]);
+  $("work").replaceChildren(box("grid",
+    card("匯入兩段錄音",...inputs,hint("不轉字，也不從文字重新朗讀。每次只轉換一段已匯入的來源錄音。")),
+    card("轉換與試聽",field("STS 模型",selection),...(isSeed&&micReady&&!mic&&!sts.running?[seedMode()]:[]),
+      hint((model?.summary||"")+(ready?(isSeed&&!sts.seedStreaming
+        ?" 完成整段轉換後可試聽及下載 WAV。":" 首段音訊可試聽；完成後可下載完整 WAV。")
+        :sts.model==="cosyvoice3"?" 請先在「模型管理」連接引擎及模型。":" 此模型未完成安裝及驗證。")),
+      box("actions",btn("開始啟動 STS 模型",warmSTSMic,{disabled:!ready||!!mic||!!sts.warming||!!sts.running})),
+      btn("停止 STS 模型",unloadSTSMic,{disabled:!!sts.warming||!!sts.running}),
+      hint(sts.warmMessage||"手動啟動會預熱並保持常駐；可隨時停止。切換常駐模型前會詢問。"),
+      el("h3",{},"TimbreDeck STS"),
+      hint(micReady?(isSeed?"Seed-VC 每 300 ms 處理一段，跨段保留上下文。建議先預熱。":"收音與播放可同時進行。")+" 要給其他程式使用，請把輸出選為已安裝的虛擬音訊線。":"此模型只開放錄音轉換；咪高峰尚未驗證。"),
+      btn(mic?"停止咪高峰":"啟動咪高峰",mic?()=>stopMic():openMic,{disabled:!mic&&(!ready||!micReady||!sts.reference||!!sts.warming||!!sts.running)}),
+      ...(micReady?[stsDevices()]:[]),
+      el("p",{id:"sts-mic",role:"status"},sts.micMessage||""),
+      box("actions",btn("開始轉換及試聽",startSTSPreview,{className:"primary",disabled:!!(mic||sts.warming||sts.loading||sts.running||!ready||!sts.source||!sts.reference)}),
+        ...(sts.audio?[btn("停止試聽",()=>{stopSTSPreview();stsStatus("已停止試聽，轉換作業可以繼續。")})]:[])),
+      el("p",{className:"hint",id:"sts-audio-status",role:"status"},sts.message||""),
+      ...(sts.job&&sts.result==="done"?[el("audio",{controls:true,preload:"none",src:"/api/audio/"+sts.job}),
+        el("a",{className:"linkbtn",href:"/api/audio/"+sts.job+"?download=1"},"下載完整 WAV")]:[]))));
+}
+function stopSTSPreview(){
+  sts.abort?.abort();
+  sts.audio?.close().catch(()=>{});
+  sts.audio=null;
+  sts.abort=null;
+}
+async function startSTSPreview(){
+  if(sts.running)return;
+  const replace=await confirmSTSResident();
+  if(replace===null)return;
+  stopSTSPreview();
+  const ctx=new AudioContext(),abort=new AbortController();
+  sts.audio=ctx;sts.abort=abort;sts.running=true;sts.result=null;sts.job=null;
+  stsStatus("準備模型及錄音，未收到音訊。");
+  drawSTS();
+  try{
+    await ctx.resume();
+    const begin=performance.now();
+    currentJob=await api("sts","POST",{source:sts.source.id,reference:sts.reference.id,model:sts.model,
+      streaming:sts.model==="seed-vc-tiny"&&!!sts.seedStreaming,replace});
+    const ack=currentJob,key=sts.job=ack.id;
+    showJob();
+    waitForJob(ack,{terminal:true}).then(onSTSJob).catch(notice);
+    if(abort.signal.aborted)return;
+    const response=await fetch("/api/sts/"+key+"/stream",{signal:abort.signal});
+    if(!response.ok||response.headers.get("X-Audio-Format")!=="pcm-s16le-mono")throw Error("未收到即時音訊；請查看作業狀態。");
+    const rate=Number(response.headers.get("X-Sample-Rate")),reader=response.body.getReader();
+    if(rate!==24000)throw Error("不支援的試聽取樣率。");
+    let next=0,extra=null,played=false;
+    while(true){
+      const {done,value}=await reader.read();if(done)break;
+      let bytes=value;
+      if(extra!==null){bytes=new Uint8Array(value.length+1);bytes[0]=extra;bytes.set(value,1);extra=null}
+      if(bytes.length%2)extra=bytes[bytes.length-1];
+      const n=bytes.length>>1;if(!n)continue;
+      const audio=ctx.createBuffer(1,n,rate),samples=audio.getChannelData(0),dv=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+      for(let i=0;i<n;i++)samples[i]=dv.getInt16(i*2,true)/32768;
+      const node=ctx.createBufferSource();node.buffer=audio;node.connect(ctx.destination);
+      if(next<ctx.currentTime+.015)next=ctx.currentTime+.04;
+      node.start(next);next+=audio.duration;
+      if(!played){played=true;stsStatus("開始串流試聽 · 首段 "+((performance.now()-begin)/1000).toFixed(2)+" 秒")}
+    }
+    if(extra!==null)throw Error("串流資料未完整。");
+  } catch(err){
+    if(!abort.signal.aborted)stsStatus(err.message);
+    if(!sts.job)sts.running=false;
+  } finally{
+    if(sts.audio===ctx && !sts.job){stopSTSPreview();if(arenaOpen==="sts")drawSTS()}
   }
-})();
+}
+
+function onSTSJob(j) {
+  if(j?.kind!=="sts" || j.id!==sts.job || jobActive(j) || sts.result===j.status)return;
+  sts.running=false;sts.result=j.status;
+  if(arenaOpen==="sts")drawSTS();
+}

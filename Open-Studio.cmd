@@ -12,4 +12,6 @@ if not defined TIMBREDECK_CLEAN_ASSETS set "TIMBREDECK_CLEAN_ASSETS=%~dp0assets"
 set "MPLCONFIGDIR=%TD_DATA%\cache\mpl"
 set "MODELSCOPE_CACHE=%TD_DATA%\cache\modelscope"
 set "NUMBA_CACHE_DIR=%TD_DATA%\cache\numba"
-"%~dp0Start.exe" -data "%TD_DATA%" %*
+set "TD_APP=%~dp0Start.exe"
+if exist "%~dp0sts-active.txt" if exist "%~dp0Start-STS.exe" set "TD_APP=%~dp0Start-STS.exe"
+"%TD_APP%" -data "%TD_DATA%" %*

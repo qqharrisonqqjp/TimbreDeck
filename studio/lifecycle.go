@@ -320,6 +320,24 @@ func (s *studio) removeTrainedModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.endRemoval()
+	if hexID(key, 32) {
+		folder := s.path("finetunes", key)
+		if installedFile(filepath.Join(folder, "model.json")) && s.managedPath(folder) {
+			metadata, err := s.loadTrainedModel(key)
+			if err != nil {
+				fail(w, 404, "找不到可移除的微調模型。")
+				return
+			}
+			if err := removeResources([]string{folder}, func() error {
+				return s.removalRecord("trained", "gpt-sovits", "v2Pro", "", key, map[string]any{"name": metadata.Name})
+			}); err != nil {
+				fail(w, 500, err.Error())
+				return
+			}
+			send(w, 200, map[string]string{"id": key})
+			return
+		}
+	}
 	project, err := s.loadTraining(key)
 	folder := s.path("training", project.ID)
 	if err != nil || !s.managedPath(folder) {

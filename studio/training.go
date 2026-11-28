@@ -18,14 +18,18 @@ import (
 )
 
 type trainingClip struct {
-	ID         string `json:"id"`
-	Reference  string `json:"reference"`
-	SourceName string `json:"sourceName"`
-	StartMS    int64  `json:"startMs"`
-	EndMS      int64  `json:"endMs"`
-	Language   string `json:"language"`
-	Transcript string `json:"transcript"`
-	Use        string `json:"use"`
+	ID             string `json:"id"`
+	Reference      string `json:"reference"`
+	SourceName     string `json:"sourceName"`
+	StartMS        int64  `json:"startMs"`
+	EndMS          int64  `json:"endMs"`
+	Language       string `json:"language"`
+	Transcript     string `json:"transcript"`
+	Use            string `json:"use"`
+	SourceGroup    string `json:"sourceGroup,omitempty"`
+	SourceOffsetMS int64  `json:"sourceOffsetMs,omitempty"`
+	ASRStatus      string `json:"asrStatus,omitempty"`
+	ASRFailed      bool   `json:"asrFailed,omitempty"`
 }
 
 type trainingProject struct {
@@ -43,6 +47,7 @@ type trainedModel struct {
 	SourceRevision string `json:"source_revision"`
 	GPT            string `json:"gpt"`
 	SoVITS         string `json:"sovits"`
+	Name           string `json:"name,omitempty"`
 }
 
 func (s *studio) loadTrainedModel(projectID string) (trainedModel, error) {
@@ -50,43 +55,58 @@ func (s *studio) loadTrainedModel(projectID string) (trainedModel, error) {
 	if !hexID(projectID, 32) {
 		return model, os.ErrNotExist
 	}
-	folder := s.path("training", projectID, "run")
+	folder := s.path("finetunes", projectID)
+	if _, err := os.Lstat(folder); os.IsNotExist(err) {
+		folder = s.path("training", projectID, "run")
+	}
+	if !s.managedPath(folder) {
+		return model, os.ErrNotExist
+	}
 	if err := readJSON(filepath.Join(folder, "model.json"), &model); err != nil {
 		return model, err
 	}
-	if model.Engine != "gpt-sovits" || model.Model != "v2Pro" || model.SourceRevision != gptTrainingSourceRevision ||
-		!filepath.IsLocal(model.GPT) || !filepath.IsLocal(model.SoVITS) ||
-		filepath.Ext(model.GPT) != ".ckpt" || filepath.Ext(model.SoVITS) != ".pth" {
-		return model, errors.New("微調模型資料與 GPT-SoVITS v2Pro 不相容。")
+	if err := checkTrainedModel(model); err != nil {
+		return model, err
 	}
 	model.GPT = filepath.Join(folder, model.GPT)
 	model.SoVITS = filepath.Join(folder, model.SoVITS)
-	if !installedFile(model.GPT) || !installedFile(model.SoVITS) {
+	if !s.managedPath(model.GPT) || !s.managedPath(model.SoVITS) || !installedFile(model.GPT) || !installedFile(model.SoVITS) {
 		return model, errors.New("微調模型缺少配對的權重。")
 	}
 	return model, nil
 }
 
 func (s *studio) trainedModels(w http.ResponseWriter, _ *http.Request) {
-	entries, err := os.ReadDir(s.path("training"))
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
 	type choice struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
 	choices := []choice{}
-	for _, entry := range entries {
-		project, err := s.loadTraining(entry.Name())
-		if err != nil {
-			continue
+	for _, dir := range []string{"training", "finetunes"} {
+		entries, err := os.ReadDir(s.path(dir))
+		if err != nil && !os.IsNotExist(err) {
+			fail(w, 500, err.Error())
+			return
 		}
-		if _, err := s.loadTrainedModel(project.ID); err == nil {
-			choices = append(choices, choice{ID: project.ID, Name: project.Name})
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			key := entry.Name()
+			if model, err := s.loadTrainedModel(key); err == nil {
+				name := model.Name
+				if name == "" {
+					project, _ := s.loadTraining(key)
+					name = project.Name
+				}
+				if name == "" {
+					name = "微調模型 " + key[:8]
+				}
+				choices = append(choices, choice{ID: key, Name: name})
+			}
 		}
 	}
+	slices.SortFunc(choices, func(a, b choice) int { return strings.Compare(a.Name, b.Name) })
 	send(w, 200, choices)
 }
 
@@ -141,6 +161,8 @@ func (s *studio) saveTraining(w http.ResponseWriter, r *http.Request) {
 		clip.Transcript = strings.TrimSpace(clip.Transcript)
 		validUse := slices.Contains([]string{"pending", "train", "holdout", "skip"}, clip.Use)
 		if !hexID(clip.ID, 32) || seen[clip.ID] || !validUse ||
+			(clip.SourceGroup != "" && !hexID(clip.SourceGroup, 32)) || clip.SourceOffsetMS < 0 || clip.SourceOffsetMS > 24*60*60*1000 ||
+			len([]rune(clip.SourceName)) > 255 || len([]rune(clip.ASRStatus)) > 250 ||
 			!slices.Contains([]string{"yue", "zh", "en", "ja", "ko"}, clip.Language) ||
 			strings.ContainsAny(clip.Transcript, "|\r\n") || len([]rune(clip.Transcript)) > 10000 {
 			fail(w, 422, fmt.Sprintf("片段 %d 的語言、用途或逐字稿無效。逐字稿請維持單行。", i+1))
@@ -199,7 +221,11 @@ func (s *studio) openTrainingClip(clip trainingClip) (*os.File, waveData, int64,
 	if !hexID(clip.Reference, 64) || clip.StartMS < 0 || clip.EndMS <= clip.StartMS {
 		return nil, waveData{}, 0, 0, bad
 	}
-	f, err := os.Open(s.path("voices", clip.Reference+".wav"))
+	path := s.path("voices", clip.Reference+".wav")
+	if !s.managedPath(path) {
+		return nil, waveData{}, 0, 0, bad
+	}
+	f, err := cleanOpen(path)
 	if err != nil {
 		return nil, waveData{}, 0, 0, errors.New("找不到原錄音。")
 	}
@@ -258,6 +284,8 @@ func detectTrainingSegments(input io.Reader, clip trainingClip, rate, block, sta
 		}
 		segment := clip
 		segment.ID, segment.Transcript, segment.Use = "", "", "pending"
+		segment.ASRStatus = ""
+		segment.ASRFailed = false
 		segment.StartMS = max(clip.StartMS, (first-rate/10)*1000/rate)
 		segment.EndMS = min(clip.EndMS, (last+rate/10)*1000/rate)
 		clips = append(clips, segment)
@@ -328,23 +356,35 @@ func (s *studio) trainingAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, clip := range project.Clips {
 		if clip.ID == r.PathValue("clip") {
-			f, err := os.CreateTemp(s.path("cache"), ".clip-*.wav")
-			if err != nil {
-				fail(w, 500, err.Error())
-				return
-			}
-			defer os.Remove(f.Name())
-			defer f.Close()
-			if err := s.writeTrainingWAV(r.Context(), f, clip); err != nil {
-				fail(w, 422, err.Error())
-				return
-			}
-			w.Header().Set("Content-Type", "audio/wav")
-			http.ServeContent(w, r, "clip.wav", time.Time{}, f)
+			s.serveTrainingClip(w, r, clip)
 			return
 		}
 	}
 	http.NotFound(w, r)
+}
+
+func (s *studio) previewTrainingClip(w http.ResponseWriter, r *http.Request) {
+	var clip trainingClip
+	if decode(w, r, &clip) {
+		s.serveTrainingClip(w, r, clip)
+	}
+}
+
+func (s *studio) serveTrainingClip(w http.ResponseWriter, r *http.Request, clip trainingClip) {
+	f, err := os.CreateTemp(s.path("cache"), ".clip-*.wav")
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := s.writeTrainingWAV(r.Context(), f, clip); err != nil {
+		fail(w, 422, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, "clip.wav", time.Time{}, f)
 }
 
 func (s *studio) trainingDataset(w http.ResponseWriter, r *http.Request) {
@@ -377,6 +417,7 @@ func (s *studio) trainingDataset(w http.ResponseWriter, r *http.Request) {
 func (s *studio) writeTrainingDataset(ctx context.Context, dst io.Writer, project trainingProject) error {
 	archive := zip.NewWriter(dst)
 	lists := map[string]*strings.Builder{"train": {}, "holdout": {}}
+	review := make(map[string]datasetSource)
 	for _, clip := range project.Clips {
 		list := lists[clip.Use]
 		if list == nil {
@@ -395,6 +436,7 @@ func (s *studio) writeTrainingDataset(ctx context.Context, dst io.Writer, projec
 			return err
 		}
 		fmt.Fprintf(list, "%s|%s|%s|%s\n", path, project.ID, strings.ToUpper(clip.Language), clip.Transcript)
+		review[path] = clipSource(clip)
 	}
 	for _, list := range []struct{ use, name string }{{"train", "dataset.list"}, {"holdout", "holdout.list"}} {
 		file, err := archive.Create(list.name)
@@ -405,13 +447,24 @@ func (s *studio) writeTrainingDataset(ctx context.Context, dst io.Writer, projec
 			return err
 		}
 	}
+	file, err := archive.Create("review.json")
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(file).Encode(review); err != nil {
+		return err
+	}
 	return archive.Close()
 }
 
 func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		ModelPath string
-		Revision  int
+		ModelPath       string
+		ASRModel        string
+		Revision        int
+		Clips           []string
+		Replace         bool
+		ReleaseResident string
 	}
 	if !decode(w, r, &in) {
 		return
@@ -427,39 +480,47 @@ func (s *studio) trainingTranscribe(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, "請先儲存或重新載入訓練專案。")
 		return
 	}
-	if !slices.ContainsFunc(project.Clips, needsTranscription) {
+	selection := make(map[string]bool)
+	for _, key := range in.Clips {
+		if !hexID(key, 32) {
+			fail(w, 422, "有片段編號無效，請先儲存專案。")
+			return
+		}
+		selection[key] = true
+	}
+	target := func(clip trainingClip) bool {
+		if len(selection) > 0 {
+			return selection[clip.ID] && clip.Use != "skip" && (in.Replace || clip.Transcript == "")
+		}
+		return needsTranscription(clip)
+	}
+	if !slices.ContainsFunc(project.Clips, target) {
 		fail(w, 422, "未有待校對的空白片段。")
 		return
 	}
-	paths, err := s.paths()
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	installation := s.inspectSelected("gpt-sovits", paths)
-	engine := installation.Path
-	if !installedFile(filepath.Join(engine, "runtime", "python.exe")) {
-		fail(w, 422, "請先連接有 faster-whisper 的 GPT-SoVITS 執行環境。")
-		return
-	}
 	model := strings.TrimSpace(in.ModelPath)
+	engine := ""
 	if model == "" {
-		model = filepath.Join(engine, "GPT_SoVITS", "pretrained_models", "faster-whisper-large-v3")
-		if candidate := installation.modelPaths["v2Pro"]; candidate != "" {
-			split := filepath.Join(candidate, "GPT_SoVITS", "pretrained_models", "faster-whisper-large-v3")
-			if installedFile(filepath.Join(split, "model.bin")) {
-				model = split
-			}
+		_, root, err := s.asrRuntime()
+		if err != nil || (in.ASRModel != "" && !asrModelAvailable(root, in.ASRModel)) {
+			fail(w, 422, "所選 ASR 模型未安裝或語音辨識環境未就緒。")
+			return
+		}
+	} else {
+		paths, err := s.paths()
+		if err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		engine = s.inspectSelected("gpt-sovits", paths).Path
+		if !installedFile(filepath.Join(engine, "runtime", "python.exe")) ||
+			!filepath.IsAbs(model) || len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
+			fail(w, 422, "請輸入完整的本機 faster-whisper 模型資料夾路徑。")
+			return
 		}
 	}
-	if strings.TrimSpace(in.ModelPath) == "" && len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
-		model = "" // No legacy model configured: use the bundled shared recognizers.
-	} else if !filepath.IsAbs(model) || len(missingFiles(model, []string{"model.bin", "config.json", "tokenizer.json"})) > 0 {
-		fail(w, 422, "請輸入完整的本機 faster-whisper 模型資料夾路徑。")
-		return
-	}
 	ctx, j, _ := s.reserveLocked("gpt-sovits", "transcription")
-	go func() { s.finish(s.transcribe(ctx, j.ID, engine, model, project)) }()
+	go func() { s.finish(s.transcribe(ctx, j.ID, engine, model, in.ASRModel, project, target)) }()
 	send(w, 202, j)
 }
 
@@ -467,7 +528,12 @@ func needsTranscription(clip trainingClip) bool {
 	return clip.Use == "pending" && clip.Transcript == ""
 }
 
-func (s *studio) transcribe(ctx context.Context, jobID, engine, model string, project trainingProject) error {
+func (s *studio) transcribe(ctx context.Context, jobID, engine, model, chosen string, project trainingProject, target func(trainingClip) bool) error {
+	return s.transcribeUsing(ctx, jobID, engine, model, chosen, project, target, s.recognizeWithModel)
+}
+
+func (s *studio) transcribeUsing(ctx context.Context, jobID, engine, model, chosen string, project trainingProject, target func(trainingClip) bool,
+	recognize func(context.Context, []string, string, string) ([]asrResult, error)) error {
 	temp, err := os.MkdirTemp(s.path("cache"), ".transcribe-*")
 	if err != nil {
 		return err
@@ -480,7 +546,7 @@ func (s *studio) transcribe(ctx context.Context, jobID, engine, model string, pr
 	}
 	var clips []input
 	for _, clip := range project.Clips {
-		if !needsTranscription(clip) {
+		if !target(clip) {
 			continue
 		}
 		path := filepath.Join(temp, clip.ID+".wav")
@@ -495,26 +561,49 @@ func (s *studio) transcribe(ctx context.Context, jobID, engine, model string, pr
 		}
 		clips = append(clips, input{ID: clip.ID, Path: path, Language: clip.Language})
 	}
-	transcripts := map[string]string{}
+	processed, written := 0, 0
+	s.updateTranscriptionProgress(jobID, processed, len(clips))
+	save := func(results map[string]asrResult) error {
+		n, err := s.saveTranscriptBatch(ctx, &project, results)
+		if err != nil {
+			return err
+		}
+		written += n
+		processed += len(results)
+		s.updateTranscriptionProgress(jobID, processed, len(clips))
+		return nil
+	}
 	if model == "" {
 		groups := make(map[string][]input)
 		for _, c := range clips {
 			groups[c.Language] = append(groups[c.Language], c)
 		}
-		for lang, group := range groups {
-			var names []string
-			for _, c := range group {
-				names = append(names, c.Path)
-			}
-			results, err := s.recognizeFiles(ctx, names, lang)
-			if err != nil {
-				return err
-			}
-			if len(results) != len(group) {
-				return errors.New("轉錄輸出數量不符。")
-			}
-			for i, c := range group {
-				transcripts[c.ID] = results[i].Text
+		languages := make([]string, 0, len(groups))
+		for lang := range groups {
+			languages = append(languages, lang)
+		}
+		slices.Sort(languages)
+		for _, lang := range languages {
+			for batch := range slices.Chunk(groups[lang], asrBatchLimit) {
+				names := make([]string, len(batch))
+				for i, c := range batch {
+					names[i] = c.Path
+				}
+				results, err := recognize(ctx, names, lang, chosen)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				values := make(map[string]asrResult, len(batch))
+				for i, c := range batch {
+					if err != nil || len(results) != len(batch) {
+						values[c.ID] = asrResult{Warning: "辨識失敗；請重試、換 ASR 模型或手動輸入。"}
+					} else {
+						values[c.ID] = results[i]
+					}
+				}
+				if err := save(values); err != nil {
+					return err
+				}
 			}
 		}
 	} else {
@@ -545,28 +634,76 @@ func (s *studio) transcribe(ctx context.Context, jobID, engine, model string, pr
 			}
 			return fmt.Errorf("轉錄失敗。請查看 logs/%s.log（%v）。", jobID, err)
 		}
+		var transcripts map[string]string
 		if err := readJSON(output, &transcripts); err != nil {
 			return err
 		}
+		values := make(map[string]asrResult, len(clips))
+		for _, c := range clips {
+			values[c.ID] = asrResult{Text: transcripts[c.ID]}
+		}
+		if err := save(values); err != nil {
+			return err
+		}
 	}
+	if written == 0 {
+		return errors.New("所選片段未能辨識到台詞；請查看各段狀態。")
+	}
+	if written < processed {
+		s.mu.Lock()
+		if s.active != nil && s.active.ID == jobID {
+			s.active.Warning = fmt.Sprintf("%d / %d 段已辨識；其餘可在校對頁重試。", written, processed)
+		}
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *studio) updateTranscriptionProgress(key string, done, total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active != nil && s.active.ID == key && s.active.Status == "running" {
+		s.active.Completed, s.active.Total = done, total
+		s.active.Detail = "正在辨識錄音；已完成的批次會先儲存。"
+	}
+}
+
+func (s *studio) saveTranscriptBatch(ctx context.Context, project *trainingProject, results map[string]asrResult) (int, error) {
 	s.files.Lock()
 	defer s.files.Unlock()
 	current, err := s.loadTraining(project.ID)
 	if err != nil || current.Revision != project.Revision {
-		return errors.New("轉錄期間專案已有更新，請儲存後再試。")
+		return 0, errors.New("轉錄期間專案已有更新；已完成的批次會保留，請重新載入後再試。")
 	}
+	written := 0
 	for i, clip := range current.Clips {
-		if needsTranscription(clip) {
-			text, found := transcripts[clip.ID]
-			if !found || strings.ContainsAny(text, "|\r\n") || len([]rune(text)) > 10000 {
-				return errors.New("轉錄輸出缺少片段或含有無效文字。")
+		if result, found := results[clip.ID]; found {
+			text := trainingTranscript(result.Text)
+			note := []rune(result.Warning)
+			current.Clips[i].ASRStatus = string(note[:min(len(note), 250)])
+			if text == "" || len([]rune(text)) > 10000 {
+				current.Clips[i].ASRFailed = true
+				if current.Clips[i].ASRStatus == "" {
+					current.Clips[i].ASRStatus = "沒有辨識到台詞；可重試或手動輸入。"
+				}
+				continue
 			}
 			current.Clips[i].Transcript = text
+			current.Clips[i].ASRFailed = false
+			written++
+			current.Clips[i].Use = "pending"
+			if current.Clips[i].ASRStatus == "" {
+				current.Clips[i].ASRStatus = "已辨識，請聆聽並核對。"
+			}
 		}
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	current.Revision++
-	return writeJSON(s.path("training", current.ID, "project.json"), current)
+	if err := writeJSON(s.path("training", current.ID, "project.json"), current); err != nil {
+		return 0, err
+	}
+	project.Revision = current.Revision
+	return written, nil
 }

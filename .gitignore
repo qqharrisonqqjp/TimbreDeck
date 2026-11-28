@@ -10,6 +10,21 @@
 /engines/indextts2/source.zip
 /config/
 /Start.exe
+/Start-STS-test.exe
+/Start-STS-mic-test.exe
+/Start-STS.exe
+/TimbreDeck-AI-sts-test.exe
+/sts-active.txt
 /local-active.txt
 /TimbreDeck-AI-candidate.exe
 __pycache__/
+# Private recordings and local exports are never part of previews.
+*.wav
+*.mp3
+*.mp4
+*.aac
+*.m4a
+*.mov
+*.flac
+*.ogg
+!/docs/examples/2B/reference.wav

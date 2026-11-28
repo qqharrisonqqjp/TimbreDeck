@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type cleanRequest struct {
 }
 
 type cleanTask struct {
+	Device     string   `json:"-"`
 	Mode       string   `json:"mode"`
 	Inputs     []string `json:"inputs"`
 	Output     string   `json:"output"`
@@ -60,8 +62,10 @@ type cleanRecording struct {
 type cleanRunner func(context.Context, cleanTask, string, string) error
 
 func supportedCleanMode(mode string) bool {
-	return mode == "denoise" || mode == "uvr" || mode == "both"
+	return slices.Contains(cleanModes, mode)
 }
+
+var cleanModes = []string{"denoise", "uvr", "both", "mossformer", "lavasr", "lavasr-denoise"}
 
 func cleanOpen(path string) (*os.File, error) {
 	info, err := os.Lstat(path)
@@ -170,7 +174,32 @@ func cleanAssetsPath() (string, error) {
 	return filepath.Abs(filepath.Join(filepath.Dir(executable), "assets"))
 }
 
+func enhancedClean(mode string) bool {
+	return mode == "mossformer" || mode == "lavasr" || mode == "lavasr-denoise"
+}
+func prepareCleanRuntime(mode, root, assets string) (string, error) {
+	if enhancedClean(mode) {
+		root = filepath.Join(assets, "enhance")
+	}
+	if !installedFile(filepath.Join(root, "runtime", "python.exe")) {
+		return "", errors.New("此清理模式未安裝本機執行環境，請先安裝相應引擎。")
+	}
+	return root, checkCleanAssets(mode, assets)
+}
 func checkCleanAssets(mode, dir string) error {
+	if enhancedClean(mode) {
+		name := "lavasr"
+		files := []string{"lavasr/enhancer_v2/config.yaml", "lavasr/enhancer_v2/pytorch_model.bin", "lavasr/denoiser/denoiser.bin"}
+		if mode == "mossformer" {
+			name = "clearvoice"
+			files = []string{"checkpoints/MossFormer2_SE_48K/last_best_checkpoint", "checkpoints/MossFormer2_SE_48K/last_best_checkpoint.pt"}
+		}
+		root := filepath.Join(dir, "enhance")
+		if len(missingFiles(root, append(files, name+".ready"))) != 0 {
+			return errors.New("此清理模式所需的本機模型未安裝，請先完成安裝。")
+		}
+		return nil
+	}
 	var files []string
 	if mode != "uvr" {
 		const folder = "speech_frcrn_ans_cirm_16k/"
@@ -220,16 +249,13 @@ func (s *studio) startClean(w http.ResponseWriter, r *http.Request, run cleanRun
 		return
 	}
 	root := s.runtimePath(engine, selection)
-	if !installedFile(filepath.Join(root, "runtime", "python.exe")) {
-		fail(w, 409, "請先在模型管理連接 GPT-SoVITS 執行環境。")
-		return
-	}
 	modelDir, err := cleanAssetsPath()
 	if err != nil {
 		fail(w, 500, "未能找到去噪模型資料夾。")
 		return
 	}
-	if err := checkCleanAssets(q.Mode, modelDir); err != nil {
+	root, err = prepareCleanRuntime(q.Mode, root, modelDir)
+	if err != nil {
 		fail(w, 409, err.Error())
 		return
 	}
@@ -244,7 +270,7 @@ func (s *studio) startClean(w http.ResponseWriter, r *http.Request, run cleanRun
 	}
 
 	ctx, j, _ := s.reserveLocked(engine, "clean")
-	p := cleanTask{Mode: q.Mode, Inputs: inputs, GapMS: q.GapMS, EngineRoot: root, Assets: modelDir}
+	p := cleanTask{Mode: q.Mode, Inputs: inputs, GapMS: q.GapMS, EngineRoot: root, Assets: modelDir, Device: s.chooseCleaningDevice()}
 	go s.cleanJob(ctx, j.ID, p, frames, run)
 	send(w, 202, j)
 }
@@ -359,6 +385,12 @@ func runCleanWorker(ctx context.Context, p cleanTask, work, logPath string) erro
 		"HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1",
 		"TMPDIR="+temp, "TEMP="+temp, "TMP="+temp, "NUMBA_CACHE_DIR="+filepath.Join(temp, "numba"),
 		"PATH="+filepath.Dir(py)+string(os.PathListSeparator)+p.EngineRoot+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if p.Device != "" {
+		cmd.Env = append(cmd.Env, "TIMBREDECK_CLEAN_DEVICE="+p.Device)
+	}
+	if enhancedClean(p.Mode) && p.Device == "cpu" {
+		cmd.Env = append(cmd.Env, "CUDA_VISIBLE_DEVICES=-1")
+	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("去噪引擎未能完成處理。請查看 logs/%s（%v）。", filepath.Base(logPath), err)
 	}

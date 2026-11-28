@@ -47,7 +47,7 @@ def read_request():
     mode = request.get("mode")
     inputs = request.get("inputs")
     gap_ms = request.get("gapMs")
-    if mode not in ("denoise", "uvr", "both"):
+    if mode not in ("denoise", "uvr", "both", "mossformer", "lavasr", "lavasr-denoise"):
         raise ValueError("Unknown cleaning mode")
     if not isinstance(inputs, list) or not 1 <= len(inputs) <= 24:
         raise ValueError("Expected 1–24 input WAVs")
@@ -226,6 +226,32 @@ def load_uvr(assets, engine, device):
     return uvr
 
 
+def load_enhancer(mode, engine, device):
+    if mode == "mossformer":
+        from clearvoice import ClearVoice
+        model = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
+        def process(samples, rate):
+            data = resample(samples, rate, 48000)
+            return windowed(data, lambda x: np.asarray(model(x[None, :])).reshape(-1),
+                            48000*8, 4800, "ClearerVoice"), 48000
+        return process
+    from LavaSR.model import LavaEnhance2
+    from LavaSR.enhancer.linkwitz_merge import FastLRMerge
+    model = LavaEnhance2(str(engine / "lavasr"), str(device))
+    def process(samples, rate):
+        model.bwe_model.lr_refiner = FastLRMerge(device=str(device), cutoff=min(rate, 16000)//2, transition_bins=1024)
+        data = resample(samples, rate, 48000)
+        def infer(x):
+            # Vocos emits whole hops and the denoiser can trim its tail.
+            # Supply lead-out padding; crop only after the model returns enough audio.
+            audio = torch.as_tensor(resample(np.pad(x, (0, 6144)), 48000, 16000), device=device).unsqueeze(0)
+            with torch.inference_mode():
+                wave = model.enhance(audio, denoise=mode=="lavasr-denoise", batch=False)
+            return wave.detach().cpu().numpy().reshape(-1)[:len(x)]
+        return windowed(data, infer, 48000*8, 4800, "LavaSR"), 48000
+    return process
+
+
 def process_request(mode, files, output, gap_ms, engine, assets):
     global np, sf, resample_poly, torch
     import numpy as np
@@ -261,6 +287,8 @@ def process_request(mode, files, output, gap_ms, engine, assets):
     uvr = load_uvr(assets, engine, device) if mode in ("uvr", "both") else None
     denoise = load_denoiser(assets, device) if mode in ("denoise", "both") else None
 
+    enhance = load_enhancer(mode, engine, device) if mode in ("mossformer", "lavasr", "lavasr-denoise") else None
+
     handle, staging = tempfile.mkstemp(prefix=".clean-", suffix=".wav", dir=str(output.parent))
     os.close(handle)
     try:
@@ -279,6 +307,8 @@ def process_request(mode, files, output, gap_ms, engine, assets):
                     if denoise:
                         samples = denoise(resample(samples, rate, DENOISE_RATE))
                         rate = DENOISE_RATE
+                    if enhance:
+                        samples, rate = enhance(samples, rate)
                     samples = finite_samples(resample(samples, rate, OUTPUT_RATE), "Sample converter")
                     if index > 1 and gap_frames:
                         destination.write(np.zeros(gap_frames, dtype=np.float32))

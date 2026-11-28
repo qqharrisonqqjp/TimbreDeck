@@ -14,6 +14,32 @@ import tempfile
 from prepare_gpt_dataset import REVISION, sha256_file
 
 
+# Import the pinned entry point as a module. Embedded Windows Python does
+# not put the script's folder on sys.path, and S2 multiprocessing needs
+# its target to live in an importable module rather than a -c __main__.
+TRAIN_LAUNCHER = """\
+import importlib, json, os, sys, types
+script, engine, *args = sys.argv[1:]
+gpt = os.path.join(engine, "GPT_SoVITS")
+sys.path[:0] = [gpt, engine, os.path.join(gpt, "eres2net")]
+sys.dont_write_bytecode = True
+sys.argv = [script, *args]
+stage = os.path.splitext(os.path.basename(script))[0]
+module = importlib.import_module(stage)
+if hasattr(module, "main"):
+    if stage == "s1_train":
+        # S1 reads YAML upstream; our generated file is JSON. PyYAML reads
+        # JSON exponential floats like 1e-05 as strings. Read it as JSON.
+        def read_config(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        module.load_yaml_config = read_config
+        module.main(types.SimpleNamespace(config_file=args[1]))
+    else:
+        module.main()
+"""
+
+
 @contextmanager
 def lock_run(run):
     run.parent.mkdir(parents=True, exist_ok=True)
@@ -67,8 +93,8 @@ def train(engine, features, run, gpu, epochs, batch, model_root=None):
                CUDA_VISIBLE_DEVICES=gpu, _CUDA_VISIBLE_DEVICES=gpu,
                PATH=os.pathsep.join((str(python.parent), str(engine), os.environ.get("PATH", ""))))
 
-    def command(*args, **kwargs):
-        return subprocess.run([str(python), "-s", *map(str, args)], cwd=engine, env=env, check=True, **kwargs)
+    def command(*args, cwd=engine, **kwargs):
+        return subprocess.run([str(python), "-s", *map(str, args)], cwd=cwd, env=env, check=True, **kwargs)
 
     command("-c", "import torch; raise SystemExit(0 if torch.cuda.is_available() else 'CUDA unavailable in training runtime')")
     inputs = ("preparation.json", "2-name2text.txt", "6-name2semantic.tsv")
@@ -127,7 +153,8 @@ def train(engine, features, run, gpu, epochs, batch, model_root=None):
             if not checkpoint.is_file() or not checkpoint.stat().st_size:
                 raise ValueError(f"missing completed checkpoint: {checkpoint}")
         else:
-            command(script, flag, run / (stage + ".json"))
+            print("Training stage", stage.upper(), flush=True)
+            command("-c", TRAIN_LAUNCHER, script, engine, flag, run / (stage + ".json"), cwd=run)
             checkpoint = latest_weights(run / (stage + "-weights"), suffix)
             write_json(marker, {"file": checkpoint.name})
         exports.append(checkpoint)

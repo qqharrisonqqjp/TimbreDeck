@@ -10,13 +10,14 @@ import (
 )
 
 type voiceProfile struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Reference    string `json:"reference"`
-	Transcript   string `json:"transcript"`
-	Language     string `json:"language"`
-	ModelProject string `json:"modelProject,omitempty"`
-	Avatar       string `json:"avatar,omitempty"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Reference     string   `json:"reference"`
+	Transcript    string   `json:"transcript"`
+	Language      string   `json:"language"`
+	ModelProject  string   `json:"modelProject,omitempty"`
+	ModelProjects []string `json:"modelProjects,omitempty"`
+	Avatar        string   `json:"avatar,omitempty"`
 }
 
 func (s *studio) profilePath(id string) string {
@@ -32,7 +33,22 @@ func (s *studio) readProfile(id string) (voiceProfile, error) {
 	if err == nil && (profile.ID != id || !hexID(profile.Reference, 64)) {
 		err = errors.New("角色資料無效。")
 	}
+	if err == nil {
+		profile.normalizeModels()
+	}
 	return profile, err
+}
+
+func (profile *voiceProfile) normalizeModels() {
+	var out []string
+	seen := make(map[string]bool)
+	for _, key := range append([]string{profile.ModelProject}, profile.ModelProjects...) {
+		if hexID(key, 32) && !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	profile.ModelProjects = out
 }
 
 func (s *studio) profiles(w http.ResponseWriter, r *http.Request) {
@@ -87,14 +103,19 @@ func (s *studio) saveProfile(w http.ResponseWriter, r *http.Request) {
 		fail(w, 422, "找不到角色頭像。")
 		return
 	}
-	if profile.ModelProject != "" {
-		if _, err := s.loadTrainedModel(profile.ModelProject); err != nil {
-			fail(w, 422, "找不到選定的微調模型。")
+	if len(profile.ModelProjects) > 32 || (profile.ModelProject != "" && !hexID(profile.ModelProject, 32)) {
+		fail(w, 422, "每個角色最多連結 32 個微調模型。")
+		return
+	}
+	profile.normalizeModels()
+	s.files.Lock()
+	defer s.files.Unlock()
+	for _, model := range profile.ModelProjects {
+		if _, err := s.loadTrainedModel(model); err != nil {
+			fail(w, 422, "找不到其中一個微調模型，請先移除失效的連結。")
 			return
 		}
 	}
-	s.files.Lock()
-	defer s.files.Unlock()
 	status := http.StatusCreated
 	if key == "" {
 		key = id()
@@ -149,6 +170,12 @@ func (s *studio) resolveProfile(q *request) (string, error) {
 	}
 	if q.RefLang == "" {
 		q.RefLang = profile.Language
+	}
+	if q.Engine == "gpt-sovits" && !gptV5(q.Variant) && q.ModelProject == "" && !q.UseBaseModel && profile.ModelProject != "" {
+		// A removed fine-tune must not prevent using the voice's reference.
+		if _, err := s.loadTrainedModel(profile.ModelProject); err == nil {
+			q.ModelProject = profile.ModelProject
+		}
 	}
 	return profile.Name, nil
 }

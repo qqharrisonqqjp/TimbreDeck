@@ -25,17 +25,23 @@ import (
 	"time"
 )
 
-//go:embed ui/* worker.py transcribe.py
+//go:embed ui/* worker.py transcribe.py checkpoint_verify.py
 var assets embed.FS
 
 type studio struct {
-	root     string
-	instance string
-	mu       sync.Mutex
-	active   *job
-	cancel   context.CancelFunc
+	root      string
+	instance  string
+	mu        sync.Mutex
+	active    *job
+	recent    []job
+	sts       *stsPreview
+	stsWorker *stsProcess
+	cancel    context.CancelFunc
 	// Serializes settings writes, including updates from the pack installer.
 	files sync.Mutex
+	// The exit request takes this gate exclusively, after current requests end.
+	requestGate sync.RWMutex
+	exit        chan struct{}
 }
 type job struct {
 	ID        string `json:"id"`
@@ -43,11 +49,14 @@ type job struct {
 	Kind      string `json:"kind"`
 	Status    string `json:"status"`
 	Detail    string `json:"detail,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 	Completed int    `json:"completed,omitempty"`
 	Total     int    `json:"total,omitempty"`
 }
 type settings struct {
 	Engine        string                     `json:"engine"`
+	Workspace     string                     `json:"workspace,omitempty"`
+	ReduceMotion  bool                       `json:"reduceMotion,omitempty"`
 	Text          string                     `json:"text"`
 	Reference     string                     `json:"reference"`
 	ReferenceName string                     `json:"referenceName"`
@@ -63,6 +72,8 @@ type installation struct {
 	External          bool     `json:"external"`
 	Missing           []string `json:"missing,omitempty"`
 	AvailableVariants []string `json:"availableVariants,omitempty"`
+	GPTV5Path         string   `json:"gptV5Path,omitempty"`
+	GPTV5Installed    bool     `json:"gptV5Installed,omitempty"`
 	variantPaths      map[string]string
 	modelPaths        map[string]string
 }
@@ -124,7 +135,7 @@ func openStudio(root string) (*studio, error) {
 	if e != nil {
 		return nil, e
 	}
-	for _, dir := range []string{"config", "voices", "outputs", "logs", "cache", "runtimes", "training"} {
+	for _, dir := range []string{"config", "voices", "outputs", "logs", "cache", "runtimes", "training", "finetunes", "training-runs"} {
 		if e = os.MkdirAll(filepath.Join(abs, dir), 0700); e != nil {
 			return nil, e
 		}
@@ -132,7 +143,7 @@ func openStudio(root string) (*studio, error) {
 	if e = os.MkdirAll(filepath.Join(abs, "voices", "profiles"), 0700); e != nil {
 		return nil, e
 	}
-	return &studio{root: abs, instance: id()}, nil
+	return &studio{root: abs, instance: id(), exit: make(chan struct{})}, nil
 }
 func (s *studio) path(parts ...string) string { return filepath.Join(s.root, filepath.Join(parts...)) }
 func (s *studio) paths() (map[string]string, error) {
@@ -298,16 +309,28 @@ func (s *studio) config(w http.ResponseWriter, r *http.Request) {
 	for k := range engineCatalog {
 		inst[k] = s.inspectSelected(k, paths)
 	}
-	send(w, 200, map[string]any{"draft": d, "engines": inst})
+	send(w, 200, map[string]any{"draft": d, "engines": inst, "build": buildInfo()})
 }
 func (s *studio) setPath(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Engine, Path string }
+	var in struct{ Engine, Path, Variant string }
 	if !decode(w, r, &in) {
 		return
 	}
 	if !supported(in.Engine) || (in.Path != "" && !filepath.IsAbs(in.Path)) {
 		fail(w, 400, "請輸入已解壓引擎的完整資料夾路徑。")
 		return
+	}
+	key := in.Engine
+	if in.Variant != "" {
+		if in.Engine != "gpt-sovits" || in.Variant != "v5" {
+			fail(w, 422, "不支援指定的引擎系列。")
+			return
+		}
+		key = gptV5Link
+		if in.Path != "" && !gptV5Runtime(in.Path) {
+			fail(w, 422, "找不到完整的 GPT-SoVITS V5 程式及 Python 執行環境。")
+			return
+		}
 	}
 	s.files.Lock()
 	defer s.files.Unlock()
@@ -317,12 +340,12 @@ func (s *studio) setPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Path == "" {
-		delete(paths, in.Engine)
+		delete(paths, key)
 	} else {
-		paths[in.Engine] = filepath.Clean(in.Path)
+		paths[key] = filepath.Clean(in.Path)
 	}
 	v := s.inspect(in.Engine, paths)
-	if !v.EngineInstalled && in.Path != "" {
+	if key != gptV5Link && !v.EngineInstalled && in.Path != "" {
 		fail(w, 422, "未找到必要檔案："+strings.Join(v.Missing, "、"))
 		return
 	}
@@ -370,9 +393,19 @@ func (s *studio) finishLocked(e error) {
 		s.active.Status = "done"
 		s.active.Detail = ""
 	}
+	// Microphone chunks share the active slot but must not evict durable job results.
+	if s.active.Kind == "sts-live" {
+		return
+	}
+	if len(s.recent) == 128 {
+		copy(s.recent, s.recent[1:])
+		s.recent = s.recent[:127]
+	}
+	s.recent = append(s.recent, *s.active)
 }
 func (s *studio) routes(host string) http.Handler {
 	m := http.NewServeMux()
+	m.HandleFunc("POST /api/studio/exit", s.requestExit)
 	m.HandleFunc("GET /api/agent/info", s.agentInfo)
 	m.HandleFunc("GET /api/state", s.config)
 	m.HandleFunc("PUT /api/draft", s.config)
@@ -383,6 +416,7 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("POST /api/datasets/auto", s.startAutoDataset)
 	m.HandleFunc("GET /api/datasets/auto", s.autoDatasetHistory)
 	m.HandleFunc("GET /api/datasets/auto/{id}/download", s.downloadAutoDataset)
+	m.HandleFunc("POST /api/datasets/auto/{id}/project", s.importAutoProject)
 	m.HandleFunc("GET /api/profiles", s.profiles)
 	m.HandleFunc("POST /api/profiles", s.saveProfile)
 	m.HandleFunc("POST /api/avatars", s.saveAvatar)
@@ -392,17 +426,36 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("GET /api/training", s.trainingProjects)
 	m.HandleFunc("POST /api/training", s.saveTraining)
 	m.HandleFunc("POST /api/training/split", s.splitTrainingClip)
+	m.HandleFunc("POST /api/training/preview", s.previewTrainingClip)
+	m.HandleFunc("POST /api/training/import", s.importTrainingDataset)
 	m.HandleFunc("PUT /api/training/{id}", s.saveTraining)
 	m.HandleFunc("GET /api/training/{id}/clip/{clip}", s.trainingAudio)
 	m.HandleFunc("GET /api/training/{id}/dataset", s.trainingDataset)
 	m.HandleFunc("POST /api/training/{id}/transcribe", s.trainingTranscribe)
+	m.HandleFunc("POST /api/training/{id}/train", s.startTraining)
+	m.HandleFunc("GET /api/training-runs", s.trainingRuns)
+	m.HandleFunc("GET /api/training-runs/{id}/dataset", s.trainingRunDataset)
 	m.HandleFunc("GET /api/trained-models", s.trainedModels)
+	m.HandleFunc("POST /api/trained-models/import", s.importTrainedModel)
+	m.HandleFunc("PATCH /api/trained-models/{id}", s.renameTrainedModel)
+	m.HandleFunc("GET /api/trained-models/{id}/download", s.downloadTrainedModel)
 	m.HandleFunc("DELETE /api/trained-models/{id}", s.removeTrainedModel)
 	m.HandleFunc("POST /api/synthesize", s.synthesize)
+	m.HandleFunc("GET /api/tts/resident", s.ttsStatus)
+	m.HandleFunc("POST /api/tts/warm", s.warmTTS)
+	m.HandleFunc("POST /api/tts/stop", s.stopTTS)
+	m.HandleFunc("POST /api/sts", s.startSTS)
+	m.HandleFunc("GET /api/sts/models", s.listSTSModels)
+	m.HandleFunc("GET /api/sts/{id}/stream", s.streamSTS)
+	m.HandleFunc("POST /api/sts/warm", s.warmSTS)
+	m.HandleFunc("GET /api/sts/worker", s.workerSTS)
+	m.HandleFunc("POST /api/sts/stop", s.workerSTS)
+	m.HandleFunc("POST /api/sts/live", s.liveSTS)
 	m.HandleFunc("POST /api/clean", s.clean)
 	m.HandleFunc("GET /api/clean/history", s.cleanHistory)
 	m.HandleFunc("GET /api/clean/audio/{id}", s.cleanAudio)
 	m.HandleFunc("GET /api/history", s.history)
+	m.HandleFunc("GET /api/history/{id}", s.historyItem)
 	m.HandleFunc("DELETE /api/audio/{id}", s.removeOutputAudio)
 	m.HandleFunc("GET /api/unused-recordings", s.listUnusedRecordings)
 	m.HandleFunc("DELETE /api/unused-recordings/{id}", s.removeUnusedRecording)
@@ -410,6 +463,7 @@ func (s *studio) routes(host string) http.Handler {
 	m.HandleFunc("GET /api/audio/{id}/parts", s.audioParts)
 	m.HandleFunc("GET /api/reference/{id}", s.referenceAudio)
 	m.HandleFunc("GET /api/job", func(w http.ResponseWriter, r *http.Request) { s.mu.Lock(); defer s.mu.Unlock(); send(w, 200, s.active) })
+	m.HandleFunc("GET /api/jobs/{id}", s.jobByID)
 	m.HandleFunc("POST /api/cancel/{id}", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -446,7 +500,15 @@ func (s *studio) routes(host string) http.Handler {
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+		if r.Method != "POST" || r.URL.Path != "/api/studio/exit" {
+			s.requestGate.RLock()
+			defer s.requestGate.RUnlock()
+			if s.exiting() {
+				fail(w, http.StatusServiceUnavailable, "工作室正在結束。")
+				return
+			}
+		}
 		m.ServeHTTP(w, r)
 	})
 }
@@ -475,6 +537,7 @@ func main() {
 		log.Fatal("無法鎖定工作資料夾，請確認聲台未在執行，並檢查寫入權限。 ", e)
 	}
 	defer lock.Close()
+	defer func() { s.mu.Lock(); defer s.mu.Unlock(); s.stopSTSWorkerLocked() }()
 	s.pruneAutoDatasetStaging()
 	if err := s.pruneCleanStaging(); err != nil {
 		log.Print("未能清理上次去噪暫存：", err)
@@ -494,23 +557,30 @@ func main() {
 		launchUI(url)
 	}
 	mux := s.routes(l.Addr().String())
-	var last, inflight atomic.Int64
+	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		inflight.Add(1)
-		defer func() { last.Store(time.Now().UnixNano()); inflight.Add(-1) }()
+		last.Store(time.Now().UnixNano())
+		defer func() { last.Store(time.Now().UnixNano()) }()
 		mux.ServeHTTP(w, r)
 	}), ReadHeaderTimeout: 10 * time.Second}
+	shutdownDone := make(chan struct{})
+	go func() {
+		<-s.exit
+		defer close(shutdownDone)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if srv.Shutdown(ctx) != nil {
+			_ = srv.Close()
+		}
+	}()
 	if *headless && *idleTTL > 0 {
 		go func() {
 			t := time.NewTicker(min(30*time.Second, *idleTTL))
 			defer t.Stop()
 			for range t.C {
-				s.mu.Lock()
-				idle := inflight.Load() == 0 && !s.busy() && len(asrActive) == 0 && time.Since(time.Unix(0, last.Load())) >= *idleTTL
-				s.mu.Unlock()
-				if idle {
-					_ = srv.Shutdown(context.Background())
+				quiet := func() bool { return time.Since(time.Unix(0, last.Load())) >= *idleTTL }
+				if quiet() && s.beginExit(quiet) {
 					return
 				}
 			}
@@ -529,6 +599,9 @@ func main() {
 	}()
 	if e = srv.Serve(l); e != nil && e != http.ErrServerClosed {
 		log.Fatal(e)
+	}
+	if s.exiting() {
+		<-shutdownDone // Let the exit confirmation reach the browser before main returns.
 	}
 }
 

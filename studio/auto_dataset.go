@@ -30,12 +30,21 @@ const (
 )
 
 type autoDatasetRequest struct {
-	References []string `json:"references"`
-	Language   string   `json:"language"`
-	Speaker    string   `json:"speaker"`
-	Denoise    bool     `json:"denoise"`
-	ASRModel   string   `json:"asrModel,omitempty"`
+	References       []string         `json:"references"`
+	Language         string           `json:"language"`
+	Speaker          string           `json:"speaker"`
+	CleanMode        string           `json:"cleanMode,omitempty"`
+	Denoise          bool             `json:"denoise"`
+	ASRModel         string           `json:"asrModel,omitempty"`
+	Split            *bool            `json:"split,omitempty"`
+	Transcribe       *bool            `json:"transcribe,omitempty"`
+	SkipUnrecognized *bool            `json:"skipUnrecognized,omitempty"`
+	SourceNames      []string         `json:"sourceNames,omitempty"`
+	Training         *trainingOptions `json:"training,omitempty"`
+	ReleaseResident  string           `json:"releaseResident,omitempty"`
 }
+
+func trueByDefault(value *bool) bool { return value == nil || *value }
 
 type autoDatasetRecord struct {
 	ID        string    `json:"id"`
@@ -48,6 +57,7 @@ type autoDatasetRecord struct {
 	Created   time.Time `json:"created"`
 	Denoise   bool      `json:"denoise"`
 	Provider  string    `json:"provider"`
+	Pending   int       `json:"pending,omitempty"`
 }
 
 type autoDatasetASR func(context.Context, []string, string) ([]asrResult, error)
@@ -65,9 +75,18 @@ func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, re
 		fail(w, 422, "請指定訓練資料的語言。")
 		return
 	}
+	if q.CleanMode != "" {
+		if q.CleanMode != "denoise" && !enhancedClean(q.CleanMode) {
+			fail(w, 422, "訓練素材清理模式無效。")
+			return
+		}
+		q.Denoise = true
+	} else if q.Denoise {
+		q.CleanMode = "denoise"
+	}
 	q.Speaker = strings.TrimSpace(q.Speaker)
 	if recognize == nil {
-		if q.ASRModel != "" {
+		if trueByDefault(q.Transcribe) && q.ASRModel != "" {
 			_, root, err := s.asrRuntime()
 			if err != nil || !asrModelAvailable(root, q.ASRModel) {
 				fail(w, 422, "所選 ASR 模型未安裝或仍未整合。")
@@ -85,6 +104,30 @@ func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, re
 		strings.ContainsRune(q.Speaker, '|') {
 		fail(w, 422, "說話者名稱最多 64 字，且不可包含控制字元或直線符號。")
 		return
+	}
+	if len(q.SourceNames) != 0 && len(q.SourceNames) != len(q.References) {
+		fail(w, 422, "錄音檔名數目不符。")
+		return
+	}
+	var trainer trainingRuntime
+	if q.Training != nil {
+		if q.Training.Name == "" {
+			q.Training.Name = q.Speaker
+		}
+		if err := q.Training.validate(); err != nil {
+			fail(w, 422, err.Error())
+			return
+		}
+		var err error
+		trainer, err = s.getTrainingRuntime()
+		if err != nil {
+			fail(w, 422, err.Error())
+			return
+		}
+		if err := s.trainingSpace(); err != nil {
+			fail(w, 507, err.Error())
+			return
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,20 +156,17 @@ func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, re
 			return
 		}
 		root := s.runtimePath(engine, selection)
-		if !installedFile(filepath.Join(root, "runtime", "python.exe")) {
-			fail(w, 409, "請先連接 GPT-SoVITS 執行環境，或關閉去噪。")
-			return
-		}
 		modelDir, err := cleanAssetsPath()
 		if err != nil {
 			fail(w, 500, "未能找到去噪模型資料夾。")
 			return
 		}
-		if err := checkCleanAssets("denoise", modelDir); err != nil {
+		root, err = prepareCleanRuntime(q.CleanMode, root, modelDir)
+		if err != nil {
 			fail(w, 409, err.Error())
 			return
 		}
-		task = cleanTask{Mode: "denoise", Inputs: inputs, EngineRoot: root, Assets: modelDir}
+		task = cleanTask{Mode: q.CleanMode, Inputs: inputs, EngineRoot: root, Assets: modelDir}
 	}
 	dir := s.path(autoDatasetDir)
 	if err := s.ensureManagedDirectory(dir); err != nil {
@@ -137,8 +177,21 @@ func (s *studio) startAutoDatasetWith(w http.ResponseWriter, r *http.Request, re
 		fail(w, 507, "訓練集工作區需要至少 256 MiB 可用空間。")
 		return
 	}
-	ctx, j, _ := s.reserveLocked(engine, "dataset")
-	go s.buildAutoDataset(ctx, j.ID, q, inputs, frames, task, recognize, clean)
+	kind := "dataset"
+	if q.Training != nil {
+		kind = "auto-training"
+		if q.ReleaseResident == "" {
+			q.ReleaseResident = q.Training.ReleaseResident
+		}
+	}
+	if q.Training != nil && !s.releaseForTraining(w, q.ReleaseResident) {
+		return
+	}
+	if q.Denoise && q.Training == nil {
+		task.Device = s.chooseCleaningDevice()
+	}
+	ctx, j, _ := s.reserveLocked(engine, kind)
+	go s.buildAutoDataset(ctx, j.ID, q, inputs, frames, task, recognize, clean, trainer)
 	send(w, 202, j)
 }
 
@@ -149,7 +202,8 @@ func autoResampledFrames(w waveData) int {
 	return int((2*uint64(w.size/w.block)*autoDatasetRate + rate) / (2 * rate))
 }
 
-func (s *studio) buildAutoDataset(ctx context.Context, key string, q autoDatasetRequest, inputs []string, frames uint64, task cleanTask, recognize autoDatasetASR, clean cleanRunner) {
+func (s *studio) buildAutoDataset(parent context.Context, key string, q autoDatasetRequest, inputs []string, frames uint64, task cleanTask, recognize autoDatasetASR, clean cleanRunner, trainer trainingRuntime) {
+	ctx := parent
 	ctx, cancel := context.WithTimeout(ctx, 50*time.Minute)
 	defer cancel()
 	base := s.path(autoDatasetDir)
@@ -159,18 +213,12 @@ func (s *studio) buildAutoDataset(ctx context.Context, key string, q autoDataset
 		s.finish(err)
 		return
 	}
-	published := false
 	defer func() {
 		_ = os.RemoveAll(work)
-		if !published {
-			if ctx.Err() != nil {
-				err = ctx.Err()
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				err = errors.New("訓練集作業超時。")
-			}
-			s.finish(err)
+		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = errors.New("訓練集作業超時。")
 		}
+		s.finish(err)
 	}()
 	result := filepath.Join(work, "result")
 	if err = os.Mkdir(result, 0700); err != nil {
@@ -191,10 +239,22 @@ func (s *studio) buildAutoDataset(ctx context.Context, key string, q autoDataset
 	}
 	s.detail("正在切分語音片段…")
 	var spans []autoDatasetSpan
+	var sources []datasetSource
 	var offset int
-	for _, n := range sourceLengths {
-		for _, span := range splitAutoDatasetSpeech(full[offset : offset+n]) {
+	for i, n := range sourceLengths {
+		source := datasetSource{Group: id(), Name: fmt.Sprintf("錄音 %d", i+1)}
+		if i < len(q.SourceNames) && validTrainingName(q.SourceNames[i], 255) {
+			source.Name = q.SourceNames[i]
+		}
+		chunks := []autoDatasetSpan{{0, n}}
+		if trueByDefault(q.Split) {
+			chunks = splitAutoDatasetSpeech(full[offset : offset+n])
+		}
+		for _, span := range chunks {
 			spans = append(spans, autoDatasetSpan{offset + span.start, offset + span.end})
+			row := source
+			row.StartMS = int64(span.start) * 1000 / autoDatasetRate
+			sources = append(sources, row)
 		}
 		offset += n
 	}
@@ -224,14 +284,17 @@ func (s *studio) buildAutoDataset(ctx context.Context, key string, q autoDataset
 			return
 		}
 	}
-	s.detail(fmt.Sprintf("正在辨識 %d 個語音片段…", len(spans)))
-	tokens, err := recognize(ctx, paths, q.Language)
-	if err != nil {
-		return
-	}
-	if len(tokens) != len(paths) {
-		err = errors.New("辨識結果與語音片段數量不符。")
-		return
+	tokens := make([]asrResult, len(paths))
+	if trueByDefault(q.Transcribe) {
+		s.detail(fmt.Sprintf("正在辨識 %d 個語音片段…", len(spans)))
+		tokens, err = recognize(ctx, paths, q.Language)
+		if err != nil {
+			return
+		}
+		if len(tokens) != len(paths) {
+			err = errors.New("辨識結果與語音片段數量不符。")
+			return
+		}
 	}
 	s.detail("正在封裝訓練集…")
 	speakerHash := sha256.Sum256([]byte("TimbreDeck speaker\x00" + q.Speaker))
@@ -240,23 +303,40 @@ func (s *studio) buildAutoDataset(ctx context.Context, key string, q autoDataset
 		Language: q.Language, Denoise: q.Denoise, Created: time.Now().UTC(),
 		Seconds: float64(len(full)) / autoDatasetRate,
 	}
-	if err = packAutoDataset(ctx, filepath.Join(result, "dataset.zip"), paths, tokens, full, &record); err != nil {
+	keepPending := !trueByDefault(q.Transcribe) || !trueByDefault(q.SkipUnrecognized)
+	if len(q.SourceNames) == 0 && q.Training == nil && !keepPending && q.Split == nil {
+		sources = nil // Preserve the legacy CLI archive shape.
+	}
+	if err = packAutoDataset(ctx, filepath.Join(result, "dataset.zip"), paths, tokens, full, &record, sources, keepPending); err != nil {
 		return
 	}
 	if err = writeJSON(filepath.Join(result, "record.json"), record); err != nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err = ctx.Err(); err != nil {
 		return
 	}
-	if err = os.Rename(result, filepath.Join(base, key)); err == nil {
-		_ = os.RemoveAll(wavDir)
-		_ = os.RemoveAll(work)
-		published = true
-		s.finishLocked(nil)
+	s.mu.Lock()
+	err = ctx.Err()
+	if err == nil {
+		err = os.Rename(result, filepath.Join(base, key))
 	}
+	s.mu.Unlock()
+	if err != nil || q.Training == nil {
+		return
+	}
+	project, err := s.importDataset(parent, filepath.Join(base, key, "dataset.zip"), q.Speaker)
+	if err != nil {
+		return
+	}
+	if record.Pending > 0 {
+		err = errors.New("已保存資料集及手動專案；有片段未有台詞。請先校對，再按「開始訓練」。")
+		return
+	}
+	if err = trainable(project, q.Training.Batch); err != nil {
+		return
+	}
+	err = s.trainProject(parent, key, project, *q.Training, trainer)
 }
 
 func loadAutoDatasetAudio(ctx context.Context, inputs []string, want uint64, denoised string) ([]int16, []int, error) {
@@ -520,7 +600,7 @@ func saveAutoWAV(ctx context.Context, file string, samples []int16) error {
 	return errors.Join(err, f.Close())
 }
 
-func packAutoDataset(ctx context.Context, file string, paths []string, tokens []asrResult, full []int16, record *autoDatasetRecord) (err error) {
+func packAutoDataset(ctx context.Context, file string, paths []string, tokens []asrResult, full []int16, record *autoDatasetRecord, sources []datasetSource, keepPending bool) (err error) {
 	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
@@ -531,32 +611,25 @@ func packAutoDataset(ctx context.Context, file string, paths []string, tokens []
 	create := func(name string) (io.Writer, error) {
 		return archive.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Store})
 	}
-	var list strings.Builder
+	var list, pending strings.Builder
+	review := make(map[string]datasetSource)
 	providers := map[string]bool{}
 	for i, token := range tokens {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// The GPT parser treats pipe, newline and other paragraph separators as
-		// structural syntax. A fullwidth pipe retains the original punctuation.
-		text := strings.Map(func(r rune) rune {
-			if r == '|' {
-				return '｜'
-			}
-			if unicode.IsControl(r) {
-				return ' '
-			}
-			return r
-		}, token.Text)
-		text = strings.Join(strings.Fields(text), " ")
-		if text == "" {
+		text := trainingTranscript(token.Text)
+		if text == "" && !keepPending {
 			record.Skipped++
 			continue
 		}
 		if utf8.RuneCountInString(text) > 2048 {
 			return errors.New("辨識文字異常過長，未建立訓練集。")
 		}
-		name := "wavs/" + filepath.Base(paths[i])
+		name, lines := "wavs/"+filepath.Base(paths[i]), &list
+		if text == "" {
+			name, lines = "review/"+filepath.Base(paths[i]), &pending
+		}
 		dst, err := create(name)
 		if err != nil {
 			return err
@@ -566,7 +639,7 @@ func packAutoDataset(ctx context.Context, file string, paths []string, tokens []
 			return err
 		}
 		info, err := src.Stat()
-		if err != nil || info.Size() <= 44 || info.Size() > 44+24*autoDatasetRate {
+		if err != nil || info.Size() <= 44 || info.Size() > 44+2*cleanTimeLimit*autoDatasetRate {
 			src.Close()
 			return errors.New("訓練片段音訊檔無效。")
 		}
@@ -574,13 +647,20 @@ func packAutoDataset(ctx context.Context, file string, paths []string, tokens []
 		if err := errors.Join(copyErr, src.Close()); err != nil {
 			return err
 		}
-		fmt.Fprintf(&list, "%s|%s|%s|%s\n", name, record.SpeakerID, strings.ToUpper(record.Language), text)
+		fmt.Fprintf(lines, "%s|%s|%s|%s\n", name, record.SpeakerID, strings.ToUpper(record.Language), text)
+		if i < len(sources) {
+			review[name] = sources[i]
+		}
+		if text == "" {
+			record.Pending++
+			continue
+		}
 		if token.Provider != "" {
 			providers[token.Provider] = true
 		}
 		record.Count++
 	}
-	if record.Count == 0 {
+	if record.Count == 0 && record.Pending == 0 {
 		return errors.New("辨識結果沒有可用的文字，未建立訓練集。")
 	}
 	names := make([]string, 0, len(providers))
@@ -595,6 +675,24 @@ func packAutoDataset(ctx context.Context, file string, paths []string, tokens []
 	}
 	if _, err := io.WriteString(dst, list.String()); err != nil {
 		return err
+	}
+	if pending.Len() > 0 {
+		dst, err = create("pending.list")
+		if err != nil {
+			return err
+		}
+		if _, err = io.WriteString(dst, pending.String()); err != nil {
+			return err
+		}
+	}
+	if len(review) > 0 {
+		dst, err = create("review.json")
+		if err != nil {
+			return err
+		}
+		if err = json.NewEncoder(dst).Encode(review); err != nil {
+			return err
+		}
 	}
 	dst, err = create("full.wav")
 	if err != nil {
@@ -627,7 +725,8 @@ func (s *studio) readAutoDataset(key string) (autoDatasetRecord, bool) {
 	}
 	d := json.NewDecoder(io.LimitReader(f, 16<<10))
 	if d.Decode(&record) != nil || d.Decode(new(any)) != io.EOF || record.ID != key ||
-		!hexID(record.SpeakerID, 32) || record.Count < 1 || record.Count > autoDatasetMaxClips ||
+		!hexID(record.SpeakerID, 32) || record.Count < 0 || record.Pending < 0 ||
+		record.Count+record.Pending < 1 || record.Count+record.Pending > autoDatasetMaxClips ||
 		!language(record.Language) || record.Language == "auto" || record.Created.IsZero() ||
 		record.Seconds <= 0 || record.Seconds > cleanTimeLimit {
 		return record, false

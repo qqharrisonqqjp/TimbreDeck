@@ -27,6 +27,14 @@ parser.add_argument("--timeout", type=int, required=True)
 subs = parser.add_subparsers(dest="action", required=True)
 subs.add_parser("capabilities")
 subs.add_parser("status")
+subs.add_parser("voices")
+subs.add_parser("resident-status")
+warm = subs.add_parser("warm-model")
+warm.add_argument("--engine", required=True)
+warm.add_argument("--kind", required=True)
+warm.add_argument("--variant")
+stop = subs.add_parser("stop-model")
+stop.add_argument("--resident-id", required=True)
 asr = subs.add_parser("asr")
 asr.add_argument("--reference", type=Path, required=True)
 asr.add_argument("--language", default="auto")
@@ -46,6 +54,10 @@ for action in ("clean", "dataset"):
         sub.add_argument("--language", required=True)
         sub.add_argument("--speaker")
         sub.add_argument("--denoise", action="store_true")
+        sub.add_argument("--clean-mode")
+        sub.add_argument("--no-split", action="store_true")
+        sub.add_argument("--no-transcribe", action="store_true")
+        sub.add_argument("--skip-unrecognized", action="store_true")
 args = parser.parse_args()
 assert args.url in (None, "http://127.0.0.1:49125") and args.timeout == 5
 result = {"ok": True, "action": args.action}
@@ -58,6 +70,8 @@ if args.action in ("synthesize", "clean", "dataset"):
         raise SystemExit(1)
     if args.action == "dataset":
         result.update(language=args.language, speaker=args.speaker, denoise=args.denoise,
+                      cleanMode=args.clean_mode,noSplit=args.no_split,noTranscribe=args.no_transcribe,
+                      skipUnrecognized=args.skip_unrecognized,
                       filenames=[p.name for p in args.reference])
         path = args.output_dir / "匯出 archive.zip"
         mime = "application/zip"
@@ -69,6 +83,7 @@ if args.action in ("synthesize", "clean", "dataset"):
         if args.action == "clean":
             shutil.copyfile(args.reference[0], path)
             result["gapMs"] = args.gap_ms
+            result["mode"] = args.mode
         else:
             if args.text == "outside":
                 path = args.output_dir.parent / "outside.wav"
@@ -90,6 +105,10 @@ elif args.action == "asr":
                   filename=args.reference.name)
 elif args.action == "status":
     result["explicitUrl"] = args.url
+elif args.action == "warm-model":
+    result.update(engine=args.engine, kind=args.kind, variant=args.variant)
+elif args.action == "stop-model":
+    result["residentId"] = args.resident_id
 print("fixture diagnostic", file=sys.stderr)
 print(json.dumps(result, ensure_ascii=False))
 '''
@@ -152,20 +171,31 @@ class TestMCP(unittest.TestCase):
             *init("2025-11-25"), rpc("notifications/ignored"), rpc("tools/list", 2), rpc("ping", 3),
             call("capabilities", 4), call("status", 5), call("asr", 6, reference="一.wav", language="yue"),
             call("synthesize", 7, engine="gpt-sovits", text="--language=en", preview=True),
-            call("clean", 8, references=["一.wav", "second.wav"], mode="both", gap_ms=0),
-            call("dataset", 9, references=["second.wav", "一.wav"], language="en", speaker="Demo", denoise=True),
+            call("clean", 8, references=["一.wav", "second.wav"], mode="mossformer", gap_ms=0),
+            call("dataset", 9, references=["second.wav", "一.wav"], language="en", speaker="Demo",
+                 clean_mode="lavasr-denoise",no_split=True,no_transcribe=True,skip_unrecognized=True),
+            call("warm_model", 10, engine="gpt-sovits", kind="tts", variant="v5turbo"),
+            call("stop_model", 11, resident_id="a"*32), call("resident_status",12),call("voices",13),
         )
-        self.assertEqual(set(result), set(range(1, 10)))
+        self.assertEqual(set(result), set(range(1, 14)))
         self.assertEqual(result[1]["result"]["protocolVersion"], "2025-11-25")
         tools = result[2]["result"]["tools"]
         self.assertEqual({t["name"] for t in tools}, {"timbredeck_" + name for name in
-                         ("capabilities", "status", "asr", "synthesize", "clean", "dataset")})
+                         ("capabilities", "status", "asr", "synthesize", "clean", "dataset", "sts",
+                          "warm_model","stop_model","resident_status","voices")})
         self.assertTrue(all(t["inputSchema"]["additionalProperties"] is False for t in tools))
         self.assertEqual(result[3]["result"], {})
         self.assertEqual(result[6]["result"]["structuredContent"]["text"], "本機逐字稿")
         self.assertEqual(result[7]["result"]["structuredContent"]["text"], "--language=en")
         self.assertTrue(result[7]["result"]["structuredContent"]["preview"])
         self.assertEqual(result[8]["result"]["structuredContent"]["gapMs"], 0)
+        self.assertEqual(result[8]["result"]["structuredContent"]["mode"], "mossformer")
+        dataset=result[9]["result"]["structuredContent"]
+        self.assertEqual([dataset[k] for k in ("cleanMode","noSplit","noTranscribe","skipUnrecognized")],
+                         ["lavasr-denoise",True,True,True])
+        self.assertEqual(result[10]["result"]["structuredContent"]["variant"],"v5turbo")
+        self.assertEqual(result[11]["result"]["structuredContent"]["residentId"],"a"*32)
+        self.assertEqual(result[12]["result"]["structuredContent"]["action"],"resident-status")
         self.assertEqual(result[9]["result"]["structuredContent"]["filenames"], ["second.wav", "一.wav"])
         for ident, suffix in ((7, "wav"), (8, "wav"), (9, "zip")):
             value = result[ident]["result"]

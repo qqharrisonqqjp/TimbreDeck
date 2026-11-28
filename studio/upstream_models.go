@@ -53,6 +53,11 @@ func officialRepos(engine, variant string) []upstreamRepo {
 	license := []string{"LICENSE", "LICENSE.txt", "LICENSE_ZH.txt"}
 	switch engine {
 	case "gpt-sovits":
+		if gptV5(variant) {
+			return []upstreamRepo{{"lj1995/GPT-SoVITS", append(license,
+				"s1v3.ckpt", "gsv-v5-pretrained/s2G"+variant+".pth", "gsv-v5-pretrained/vocoder.pth",
+				"chinese-roberta-wwm-ext-large/", "chinese-hubert-base/"), false}}
+		}
 		return []upstreamRepo{{"lj1995/GPT-SoVITS", append(license,
 			"s1v3.ckpt", "v2Pro/s2Gv2Pro.pth", "v2Pro/s2Dv2Pro.pth",
 			"sv/pretrained_eres2netv2w24s4ep4.ckpt", "chinese-roberta-wwm-ext-large/", "chinese-hubert-base/"), false}}
